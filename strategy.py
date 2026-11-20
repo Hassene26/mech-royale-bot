@@ -3,6 +3,7 @@
 valid Action. Owned by mech-strategy. See docs/INTERFACES.md."""
 import math
 
+from mechfight import log
 from params import PARAMS
 from tracker import Tracker
 
@@ -31,6 +32,7 @@ class Strategy:
         # tracker.world before the first update(); every consumer must tolerate None.
         self.tracker.world = world
         self.combat = Combat(hello) if Combat is not None else None
+        self.reported_hide_error = False
 
     # --- phase selection -------------------------------------------------
     def _phase(self, obs, tracker):
@@ -55,10 +57,15 @@ class Strategy:
             threats = [tr.pos[:2] for tr in tracker.enemies.values()]
             if tracker.world is not None:
                 try:
-                    return tracker.world.best_hide(tracker.safe_center_xy, tracker.safe_radius,
-                                                    threats, tracker.safe_center_xy)
-                except Exception:
-                    pass
+                    center, radius = tracker.safe_center_xy, tracker.safe_radius
+                    return tracker.world.best_hide(
+                        center, min(radius, PARAMS["hide_search_radius_m"]), threats,
+                        zone_next=(center, radius),
+                    )
+                except Exception as exc:
+                    if not self.reported_hide_error:
+                        log("Cover selection failed, using zone center:", exc)
+                        self.reported_hide_error = True
             return tracker.safe_center_xy
         # loot: head for the nearest remembered crate/cube, else drift toward the safe circle
         candidates = [v[0] for v in tracker.crates.values()] + [v[0] for v in tracker.cubes.values()]
@@ -68,6 +75,8 @@ class Strategy:
 
     def _move_toward(self, obs, tracker, goal):
         x, y, _ = obs["self"]["pos"]
+        if (x, y) == tuple(goal):
+            return 0.0, 0.0
         if tracker.world is not None:
             try:
                 return tracker.world.next_step((x, y), goal, avoid=tracker.threat_at)
@@ -104,7 +113,7 @@ class Strategy:
             "tick": obs["tick"],
             "move": [dx, dy],
             "aim": [yaw, 0.0],
-            "boost": (not me["in_zone"]) or phase == "endgame",
+            "boost": not me["in_zone"] and bool(dx or dy),
         }
 
         engage = -1.0
