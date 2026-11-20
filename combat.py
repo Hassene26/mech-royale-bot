@@ -212,6 +212,10 @@ class Combat:
             stats = self.cfg["weapons"]["laser"] | slot.get("stats", {})
             if (not intent.get("allow_fire", True) or not target or target["id"] != target_id
                     or not self._shot(me, target, "laser", stats, tracker)):
+                if rear is not None:
+                    # A rear hit takes precedence over releasing on the old lock.
+                    self.laser_point = None
+                    return out
                 body = self.cfg["mech"] | me.get("stats", {})
                 dx, dy, dz = (a - b for a, b in zip(point, me["pos"]))
                 dz -= body["muzzle_height"]
