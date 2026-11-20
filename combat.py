@@ -119,7 +119,8 @@ class Combat:
         world = getattr(tracker, "world", None)
         if world:
             last = (x, y, z)
-            segments = max(1, math.ceil(math.sqrt(rise / radius))) if rise else 1
+            # Bound each chord's vertical error to 0.25 game meters.
+            segments = max(1, math.ceil(math.sqrt(rise)))
             for j in range(1, segments+1):
                 f = j / segments
                 point = (x+dx*f, y+dy*f, z+dz*f + rise*f*(1-f))
