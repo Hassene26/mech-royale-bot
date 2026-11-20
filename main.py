@@ -1,35 +1,76 @@
-"""Example bot: walk to the zone, grab a weapon, shoot the nearest mech, draw what it's thinking."""
+"""Entrypoint: mf.run(Bot). Crash-proof (Strategy construction and every act() call are guarded) and
+time-guarded (a SIGALRM hard deadline aborts a slow decision before the server's 50ms budget is hit).
+Always returns a valid action: falls back to a simple zone-walk when Strategy is unavailable, errors,
+or overruns its budget. Owned by mech-strategy."""
 import math
+import signal
+import traceback
+
 import mechfight as mf
+
+try:
+    from strategy import Strategy
+except Exception:
+    Strategy = None
+
+TICK_BUDGET_S = 0.05      # protocol's tick_budget_ms
+ALARM_BUDGET_S = 0.035    # hard backstop well under the wall-clock budget (steady-state target < 15ms)
+_HAS_ALARM = hasattr(signal, "setitimer") and hasattr(signal, "SIGALRM")
+
+
+class _Timeout(Exception):
+    pass
+
+
+def _on_alarm(signum, frame):
+    raise _Timeout()
+
+
+def _fallback_action(obs):
+    """Zone-walk: move toward the next safe circle, boosting if already taking zone damage."""
+    me = obs["self"]
+    x, y, _ = me["pos"]
+    gx, gy = obs["zone"]["next_center"]
+    yaw = math.atan2(gy - y, gx - x)
+    return {"tick": obs["tick"], "move": [math.cos(yaw), math.sin(yaw)],
+            "aim": [yaw, 0.0], "boost": not me["in_zone"]}
 
 
 class Bot:
-    name = "example-py"
+    name = "mech-strategy"
 
     def __init__(self, hello: mf.Hello):
-        self.reach = hello["config"]["loot"]["pickup_radius"]
+        self.strategy = None
+        if Strategy is None:
+            return
+        try:
+            self.strategy = Strategy(hello)
+        except Exception:
+            mf.log("Strategy() failed, falling back to zone-walk for the whole match:\n" + traceback.format_exc())
+            self.strategy = None
 
     def act(self, obs: mf.Observation) -> mf.Action:
-        me = obs["self"]
-        x, y, z = me["pos"]
-        goal = obs["zone"]["next_center"]
-        act: mf.Action = {"tick": obs["tick"]}
-        if obs["offer"]:
-            act["pick"] = 0
-        near = [p for p in obs["pickups"] if math.dist(p["pos"][:2], (x, y)) < self.reach]
-        if me["weapons"][1] is None and near and near[0]["kind"] != "gun":
-            act["take"] = near[0]["id"]
-        enemies = sorted((m for m in obs["mechs"] if m["kind"] == "mech"), key=lambda m: math.dist(m["pos"], me["pos"]))
-        yaw = math.atan2(goal[1] - y, goal[0] - x)
-        act.update(move=[math.cos(yaw), math.sin(yaw)], aim=[yaw, 0.0], boost=not me["in_zone"], jump=obs["tick"] % 40 == 0)
-        if enemies:
-            t = enemies[0]["pos"]
-            aim = [math.atan2(t[1] - y, t[0] - x), math.atan2(t[2] - z - 2.5, math.dist(t[:2], (x, y)))]
-            act.update(aim=aim, fire=[True, True])
-            mf.draw.line([x, y, z + 7], [t[0], t[1], t[2] + 4.5], "#ff5040")
-        mf.draw.point([goal[0], goal[1], z], "#40c0ff", 6)
-        mf.draw.label(f"hp {me['hp']:.0f} · {len(enemies)} in sight")
-        return act
+        if self.strategy is None:
+            return _fallback_action(obs)
+
+        old_handler = None
+        if _HAS_ALARM:
+            old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+            signal.setitimer(signal.ITIMER_REAL, ALARM_BUDGET_S)
+        try:
+            action = self.strategy.act(obs)
+            if isinstance(action, dict) and "tick" in action:
+                return action
+            mf.log(f"tick {obs['tick']}: strategy.act returned {action!r}, using fallback")
+        except _Timeout:
+            mf.log(f"tick {obs['tick']}: strategy.act exceeded {ALARM_BUDGET_S * 1000:.0f}ms, using fallback")
+        except Exception:
+            mf.log(f"tick {obs['tick']}: strategy.act failed:\n" + traceback.format_exc())
+        finally:
+            if _HAS_ALARM:
+                signal.setitimer(signal.ITIMER_REAL, 0)
+                signal.signal(signal.SIGALRM, old_handler)
+        return _fallback_action(obs)
 
 
 mf.run(Bot)
