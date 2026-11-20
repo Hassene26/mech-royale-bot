@@ -33,6 +33,11 @@ class Strategy:
         self.tracker.world = world
         self.combat = Combat(hello) if Combat is not None else None
         self.reported_hide_error = False
+        self.reported_route_error = False
+
+    def _avoid(self, x, y):
+        """World avoid(x, y) -> float. threat_at takes one xy; do not pass the method itself."""
+        return self.tracker.threat_at((x, y))
 
     # --- phase selection -------------------------------------------------
     def _phase(self, obs, tracker):
@@ -75,14 +80,18 @@ class Strategy:
 
     def _move_toward(self, obs, tracker, goal):
         x, y, _ = obs["self"]["pos"]
-        if (x, y) == tuple(goal):
+        gx, gy = goal[0], goal[1]
+        if (x, y) == (gx, gy):
             return 0.0, 0.0
         if tracker.world is not None:
             try:
-                return tracker.world.next_step((x, y), goal, avoid=tracker.threat_at)
-            except Exception:
-                pass
-        yaw = math.atan2(goal[1] - y, goal[0] - x)
+                avoid = self._avoid if tracker._threats else None
+                return tracker.world.next_step((x, y), (gx, gy), avoid=avoid)
+            except Exception as exc:
+                if not self.reported_route_error:
+                    log("Weighted route failed, steering straight:", exc)
+                    self.reported_route_error = True
+        yaw = math.atan2(gy - y, gx - x)
         return math.cos(yaw), math.sin(yaw)
 
     # --- fire discipline -------------------------------------------------

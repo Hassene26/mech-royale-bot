@@ -18,8 +18,8 @@ ALARM_BUDGET_S = 0.035    # hard backstop well under the wall-clock budget (stea
 _HAS_ALARM = hasattr(signal, "setitimer") and hasattr(signal, "SIGALRM")
 
 
-class _Timeout(Exception):
-    pass
+class _Timeout(BaseException):
+    """Alarm must not be swallowed by `except Exception` inside nav or combat."""
 
 
 def _on_alarm(signum, frame):

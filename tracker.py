@@ -41,6 +41,7 @@ class Tracker:
         self._t = 0.0
         self._last_known_center = tuple(self.cfg["zone"]["start_center"])
         self._phase_bounds = self._build_phase_bounds()
+        self._threats = ()
 
     def _build_phase_bounds(self):
         bounds = []
@@ -59,23 +60,21 @@ class Tracker:
         return len(self._phase_bounds)
 
     def zone_at(self, t_s):
-        """Estimated (center_xy, radius, dps) at a future match time. radius/dps/timing come from
-        hello.config.zone.phases (exact); center uses the last OBSERVED circle, since true future
+        """Estimated (center_xy, radius) at match time t_s. Radius and timing come from
+        hello.config.zone.phases; center uses the last OBSERVED circle, since true future
         recentres aren't knowable until the server reveals them as `next_center`. Good enough for
-        endgame timing math (e.g. "last circle closes ~t=415s"), not for exact future positions."""
+        endgame timing math (e.g. "last circle closes ~t=415s"), not for exact future positions.
+        DPS stays on the phase table and is not part of this return (INTERFACES: two values)."""
         center = self._last_known_center
         radius = self.cfg["zone"]["start_radius"]
-        t0 = 0.0
-        for hold_end, shrink_end, next_radius, dps in self._phase_bounds:
+        for hold_end, shrink_end, next_radius, _dps in self._phase_bounds:
             if t_s <= hold_end:
-                return center, radius, dps
+                return center, radius
             if t_s <= shrink_end:
                 f = (t_s - hold_end) / max(shrink_end - hold_end, 1e-9)
-                return center, radius + (next_radius - radius) * f, dps
+                return center, radius + (next_radius - radius) * f
             radius = next_radius
-            t0 = shrink_end
-        last_dps = self._phase_bounds[-1][3] if self._phase_bounds else 0.0
-        return center, radius, last_dps
+        return center, radius
 
     def _threat_of(self, m):
         hp = m.get("hp")
@@ -122,6 +121,14 @@ class Tracker:
                  if i not in seen_ids and t - tr.last_seen_t > (GHOST_TTL_S if tr.ghost else MEMORY_S)]
         for i in stale:
             del self.enemies[i]
+        samples = []
+        for tr in self.enemies.values():
+            weight = tr.est_threat
+            if weight <= 0.0:
+                continue
+            reach = 60.0 if tr.ghost else 200.0
+            samples.append((tr.pos[0], tr.pos[1], reach * reach, weight, reach))
+        self._threats = tuple(samples)
 
         for c in obs["cubes"]:
             self.cubes[c["id"]] = (tuple(c["pos"]), t)
@@ -133,11 +140,15 @@ class Tracker:
             self.drops[d["id"]] = d
 
     def threat_at(self, xy):
-        """Danger map value at a world xy: 0 = safe, higher = more exposed to known/suspected threats."""
+        """Danger map value at a world xy: 0 = safe, higher = more exposed to known/suspected threats.
+        Samples are rebuilt in update(); A* calls this as avoid(x, y) via Strategy._avoid."""
+        x, y = xy[0], xy[1]
         danger = 0.0
-        for tr in self.enemies.values():
-            d = math.dist(tr.pos[:2], xy)
-            reach = 60.0 if tr.ghost else 200.0
-            if d < reach:
-                danger += tr.est_threat * (1.0 - d / reach)
+        sqrt = math.sqrt
+        for tx, ty, reach2, weight, reach in self._threats:
+            dx = x - tx
+            dy = y - ty
+            d2 = dx * dx + dy * dy
+            if d2 < reach2:
+                danger += weight * (1.0 - sqrt(d2) / reach)
         return danger
