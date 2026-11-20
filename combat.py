@@ -71,13 +71,19 @@ class Combat:
         if choices:
             out.pick = min(range(len(choices)), key=lambda i: self.upgrades.get(choices[i]["id"], math.inf))
 
+    def _target_size(self, target):
+        kind = target.get("kind")
+        dims = self.cfg[{"npc": "npc", "mech": "mech"}.get(kind, "crates")]
+        scale = 1 + self.cfg["cubes"]["size_per_cube"] * target.get("cubes", 0) if kind == "mech" else 1
+        return dims["height"] * scale, dims["radius"] * scale
+
     def _shot(self, me, target, kind, stats, tracker):
-        dims = self.cfg[{"npc": "npc", "mech": "mech"}.get(target.get("kind"), "crates")]
+        height, radius = self._target_size(target)
         x, y, z = me["pos"]
         body = self.cfg["mech"] | me.get("stats", {})
         z += body["height"] + 0.5 if kind == "mortar" else body["muzzle_height"]
         dx, dy, dz = (v - u for v, u in zip(target["pos"], (x, y, z)))
-        dz += dims["height"] / 2
+        dz += height / 2
         vx, vy, vz = target.get("vel", (0, 0, 0))
         speed = stats.get("speed")
         gravity = stats.get("gravity", 0)
@@ -113,14 +119,14 @@ class Combat:
         world = getattr(tracker, "world", None)
         if world:
             last = (x, y, z)
-            segments = max(1, math.ceil(math.sqrt(rise / dims["radius"]))) if rise else 1
+            segments = max(1, math.ceil(math.sqrt(rise / radius))) if rise else 1
             for j in range(1, segments+1):
                 f = j / segments
                 point = (x+dx*f, y+dy*f, z+dz*f + rise*f*(1-f))
                 if not world.shot_clear(last, point):
                     return
                 last = point
-        tolerance = math.atan2(dims["radius"], max(distance, 1e-9))
+        tolerance = math.atan2(radius, max(distance, 1e-9))
         yaw_error = abs(math.remainder(aim[0] - me["aim"][0], math.tau))
         aligned = yaw_error <= tolerance and abs(aim[1]-me["aim"][1]) <= tolerance
         if kind == "lightning":
@@ -235,9 +241,9 @@ class Combat:
         if options:
             _, i, (out.aim, aligned, _), kind, stats = max(options)
             if kind == "laser":
-                dims = self.cfg[{"npc": "npc", "mech": "mech"}.get(target.get("kind"), "crates")]
+                height, radius = self._target_size(target)
                 x, y, z = target["pos"]
-                self.laser_point = target["id"], (x, y, z + dims["height"] / 2), dims["radius"]
+                self.laser_point = target["id"], (x, y, z + height / 2), radius
                 charge = me["weapons"][i].get("charge", 0)
                 out.fire[i] = (aligned or charge > 0) and not (aligned and charge >= stats["charge"])
             else:
