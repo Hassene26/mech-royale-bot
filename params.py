@@ -26,6 +26,8 @@ PARAMS = {
     "cover_commit_s": 1.2,           # keep a chosen hidden spot this long before re-choosing
     "cover_reach_m": 1.5,            # close enough to a hidden spot to choose again
     "cover_budget_ms": 4.0,          # world.best_hide time budget per decision
+    "cover_path_budget_ms": 4.0,     # per candidate route check before committing
+    "cover_stall_move": 0.05,        # minimum move magnitude when pursuing cover under fire
     "cover_min_radius_m": 25.0,      # below this circle size the endgame centre rule applies
     "hold_zone_margin_m": 2.0,       # hold still only this far inside the next circle
     "crate_fire_range_m": 35.0,      # loot-phase crate shots only this close (same as farm_range)

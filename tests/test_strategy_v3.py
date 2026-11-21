@@ -7,6 +7,7 @@ import math
 import os
 import sys
 import unittest
+from unittest.mock import patch
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 BOT = os.path.dirname(HERE)
@@ -146,6 +147,35 @@ class StrategyV3Test(unittest.TestCase):
                 break
 
         self.assertGreater(math.dist(obs["self"]["pos"][:2], drone_xy), drone_range)
+
+    def test_retreats_when_drone_cover_is_unreachable(self):
+        strat, obs = self.fresh(t=70.0, sounds=[], crates=[], cubes=[], pickups=[])
+        world = strat.tracker.world
+        xy = (-283.0, 0.0)
+        drone_xy = (-295.5, 15.2)
+        cover = (-283.0, -12.0)
+        obs["self"]["pos"] = [*xy, world.ground_z(*xy)]
+        drone = _mech(104, (*drone_xy, world.ground_z(*drone_xy))) | {"kind": "npc"}
+        obs["mechs"] = [drone]
+        obs["events"] = [{"type": "damaged", "amount": 25, "weapon": "npc", "by": 104,
+                          "bearing": math.atan2(drone_xy[1] - xy[1], drone_xy[0] - xy[0])}]
+        strat.tracker.update(obs)
+        center, radius = strat.tracker.safe_center_xy, strat.tracker.safe_radius
+        self.assertEqual(world.path(xy, cover), [xy])
+        self.assertTrue(strat._hidden_spot(cover, [drone["pos"]]))
+
+        with patch.object(world, "best_hide", return_value=cover):
+            self.assertIsNone(strat._cover_goal(xy, [drone["pos"]], center, radius, 24.0))
+            action = strat.act(obs)
+        dx, dy = action["move"]
+        self.assertGreater(math.hypot(dx, dy), 0.5)
+        self.assertFalse(world.blocked(xy[0] + dx * strat.max_step, xy[1] + dy * strat.max_step))
+
+        # A previously committed route can fail even after passing selection.
+        strat._cover = (cover, obs["t"])
+        self.assertGreater(math.hypot(*strat.act(obs)["move"]), 0.5)
+        self.assertIsNone(strat._cover)
+        self.assertGreater(strat._cover_retry_t, obs["t"])
 
     def test_hidden_attacker_falls_back_to_visible_mech(self):
         strat, obs = self.fresh()

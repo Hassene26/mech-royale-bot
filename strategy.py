@@ -48,6 +48,7 @@ class Strategy:
         self._npc_by = None
         self._npc_bearing = None
         self._cover = None           # (goal_xy, chosen_t) committed hidden spot
+        self._cover_retry_t = -math.inf
         # Braking (survival-v3 item 3): full speed beyond one decision's walk, linear inside it.
         match = self.cfg["match"]
         self.max_step = self.cfg["mech"]["walk_speed"] * match["decide_every"] / match["tick_hz"]
@@ -94,7 +95,7 @@ class Strategy:
             return True
 
     def _cover_goal(self, xy, points, center, radius, search_m):
-        """Hidden spot within search_m of us, inside the next circle with margin. None if unavailable."""
+        """Reachable hidden spot within search_m of us and inside the next circle."""
         world = self.tracker.world
         if world is None:
             return None
@@ -105,15 +106,17 @@ class Strategy:
                 xy, min(search_m, zone_r), [p[:2] for p in points],
                 zone_next=(center, zone_r), budget_ms=PARAMS["cover_budget_ms"], me_xy=xy,
             )
+            goal = (float(goal[0]), float(goal[1]))
+            if math.dist(goal, center) > zone_r or not self._hidden_spot(goal, points):
+                return None
+            route = world.path(xy, goal, budget_ms=PARAMS["cover_path_budget_ms"])
+            if route and math.dist(route[-1], goal) <= PARAMS["cover_reach_m"]:
+                return goal
         except Exception as exc:
             if not self.reported_cover_error:
                 log("Cover selection failed, not taking cover:", exc)
                 self.reported_cover_error = True
-            return None
-        goal = (float(goal[0]), float(goal[1]))
-        if math.dist(goal, center) > zone_r or not self._hidden_spot(goal, points):
-            return None
-        return goal
+        return None
 
     def _hidden_spot(self, goal, points):
         """True if no threat point can see the goal (server vision rule, eye z+8, body z+9)."""
@@ -169,6 +172,33 @@ class Strategy:
                 return goal
             side = -side
         return center
+
+    def _npc_retreat(self, xy, npc, center, radius, nearby=False):
+        """Walk directly away when clear, or use a walkable side step around an obstacle."""
+        bearing = math.atan2(xy[1] - npc[1], xy[0] - npc[0])
+        world = self.tracker.world
+        inner = max(radius - PARAMS["hold_zone_margin_m"], math.dist(xy, center))
+        if nearby:
+            distance = self.max_step
+            angles = (0, math.pi / 4, -math.pi / 4, math.pi / 2, -math.pi / 2)
+        else:
+            distance = PARAMS["strafe_offset_m"]
+            angles = (0,)
+        for angle in angles:
+            dx, dy = math.cos(bearing + angle), math.sin(bearing + angle)
+            goal = xy[0] + dx * distance, xy[1] + dy * distance
+            if math.dist(goal, center) > inner:
+                continue
+            if world is None or (not world.blocked(*goal) if nearby else world.walk_clear(xy, goal)):
+                return dx, dy
+        return None
+
+    def _cover_stalled(self, xy, move):
+        if math.hypot(*move) < PARAMS["cover_stall_move"]:
+            return True
+        world = self.tracker.world
+        step = xy[0] + move[0] * self.max_step, xy[1] + move[1] * self.max_step
+        return world is not None and world.blocked(*step)
 
     # --- navigation target -------------------------------------------------
     def _nav_target(self, obs, tracker, phase):
@@ -279,14 +309,17 @@ class Strategy:
         phase = self._phase(obs, tracker)
         under_fire = t - self._hit_t <= PARAMS["under_fire_s"]
         npc_fire = t - self._npc_t <= PARAMS["under_fire_s"]
-        hold = False
-        threat_goal = None
+        move = None
+        points = []
+        npc = None
+        drone_only = False
+        following_cover = False
 
         center, radius = tracker.safe_center_xy, tracker.safe_radius
         if phase != "endgame" and me["in_zone"] and radius >= PARAMS["cover_min_radius_m"]:
             threats = self._mech_threats(xy, t)
             seen_now = any(tr.last_seen_t == t for tr in threats)
-            if threats or under_fire or npc_fire:
+            if under_fire or seen_now or npc_fire:
                 points = [tr.pos for tr in threats]
                 if not points and under_fire and self._hit_bearing is not None:
                     # Shot from outside sight: treat the bearing as a threat 40 m out.
@@ -297,33 +330,39 @@ class Strategy:
                 npc = self._npc_threat_point(obs) if npc_fire else None
                 if npc is not None:
                     points.append(npc)
-                if under_fire or seen_now or npc_fire:
-                    # A fresh drone hit overrides the map's estimate of whether we are hidden.
-                    hidden = bool(points) and t != self._npc_t and not self._exposed_to(obs, points)
-                    if hidden and math.dist(xy, center) <= radius - PARAMS["hold_zone_margin_m"]:
-                        hold = True          # hidden and inside the circle: stand still, silent
-                        self._cover = None
-                    else:
-                        threat_goal = self._threat_goal(xy, points, center, radius, t)
-                        if threat_goal is None or (npc is not None and threat_goal == xy):
-                            exposers = points
-                            if npc is None:
-                                exposers = [p for p in points if self._exposed_to(obs, [p])] or points
-                            if exposers:
-                                threat_goal = self._evade_goal(xy, exposers, center, radius, t, npc=npc)
+                drone_only = npc is not None and not (threats or under_fire)
+                # A fresh drone hit overrides the map's estimate of whether we are hidden.
+                hidden = bool(points) and t != self._npc_t and not self._exposed_to(obs, points)
+                if hidden and math.dist(xy, center) <= radius - PARAMS["hold_zone_margin_m"]:
+                    move = (0.0, 0.0)
+                elif drone_only:
+                    move = self._npc_retreat(xy, npc, center, radius)
 
-        if hold:
-            goal = xy
-        elif threat_goal is not None:
-            goal = threat_goal
-        else:
+                if move is None and t >= self._cover_retry_t:
+                    goal = self._threat_goal(xy, points, center, radius, t)
+                    if goal is not None:
+                        move = self._move_toward(obs, tracker, goal)
+                        if (under_fire or npc_fire) and self._cover_stalled(xy, move):
+                            move = None
+                            self._cover_retry_t = t + PARAMS["cover_commit_s"]
+                        else:
+                            following_cover = True
+
+        if not following_cover:
             self._cover = None
-            goal = self._nav_target(obs, tracker, phase)
+        if move is None and drone_only:
+            move = self._npc_retreat(xy, npc, center, radius, nearby=True)
+        if move is None:
+            if points:
+                exposers = points
+                if npc is None:
+                    exposers = [p for p in points if self._exposed_to(obs, [p])] or points
+                goal = self._evade_goal(xy, exposers, center, radius, t, npc=npc)
+            else:
+                goal = self._nav_target(obs, tracker, phase)
+            move = self._move_toward(obs, tracker, goal)
 
-        if hold:
-            dx, dy = 0.0, 0.0
-        else:
-            dx, dy = self._move_toward(obs, tracker, goal)
+        dx, dy = move
         yaw = math.atan2(dy, dx) if (dx or dy) else me["aim"][0]
 
         action = {
