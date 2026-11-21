@@ -289,6 +289,8 @@ class Strategy:
         """Face the nearest confirmed contact while neither weapon needs an aim."""
         # Tracker prunes stale contacts before act computes aim. Do not cap contact
         # memory at base visual range, since sensors can increase actual sight.
+        if under_fire and self._hit_bearing is not None:
+            return self._hit_bearing  # never keep the back to whoever is hitting us
         contacts = (tr for tr in self.tracker.enemies.values() if not tr.ghost)
         nearest = min(contacts, key=lambda tr: math.dist(xy, tr.pos[:2]), default=None)
         if nearest is not None:
