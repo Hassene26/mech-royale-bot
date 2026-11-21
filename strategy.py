@@ -56,6 +56,7 @@ class Strategy:
         self._escape = None          # zone key while heading for the next centre after a ban
         self._prog = None            # (goal_xy, t0, dist0) progress check for normal navigation
         self._reach_t = -math.inf    # last 20 ms reachability route check
+        self._retreat = None         # (drone id, start t) until clear of its last known position
         self._npcs = {}              # drone id -> last seen xy
         self.near_range_m = self.cfg["vision"].get("near_range", 45.0)
         # Braking (survival-v3 item 3): full speed beyond one decision's walk, linear inside it.
@@ -202,6 +203,25 @@ class Strategy:
                 return dx, dy
         return None
 
+    def _retreat_move(self, obs, xy, center, radius, phase):
+        """D1: after a drone hit, keep backing away from its last known position until we are
+        beyond retreat_clear_m and it is out of sight. Zone first: no retreat while outside the
+        zone, late for the next circle, or in cand-6 endgame mode; never away from the next circle."""
+        if self._retreat is None:
+            return None
+        nid, start = self._retreat
+        npc = self._npcs.get(nid)
+        visible = any(m["kind"] == "npc" and m["id"] == nid for m in obs["mechs"])
+        if (npc is None or obs["t"] - start > PARAMS["retreat_max_s"]
+                or (math.dist(xy, npc) > PARAMS["retreat_clear_m"] and not visible)):
+            self._retreat = None
+            return None
+        if (self._classic(phase, radius) or not obs["self"]["in_zone"]
+                or self._late(obs, xy, center, radius)):
+            return None
+        return (self._npc_retreat(xy, npc, center, radius)
+                or self._npc_retreat(xy, npc, center, radius, nearby=True))
+
     @staticmethod
     def _toward_drone(xy, move, npc):
         """True when the move has a negative component along the away-from-drone direction."""
@@ -262,7 +282,7 @@ class Strategy:
         if self._stage is not None:
             stage, chosen, skey = self._stage
             if skey == key and not self._is_banned(key, stage):
-                if t - chosen < PARAMS["stage_commit_s"]:
+                if t - chosen < PARAMS["stage_commit_s"] and not self._near_drop(obs, stage):
                     return stage
                 old = stage
         margin = min(max(radius * PARAMS["edge_margin_frac"], PARAMS["edge_margin_min_m"]),
@@ -381,7 +401,8 @@ class Strategy:
         if self._hide is not None:
             hide, chosen, hstage, hkey = self._hide
             valid = (hkey == key and hstage == stage and math.dist(hide, center) <= zone_r
-                     and not (sighted and t - chosen >= PARAMS["hide_commit_s"]))
+                     and not (sighted and t - chosen >= PARAMS["hide_commit_s"])
+                     and not (self._near_drop(obs, hide) and not self._near_drop(obs, stage)))
             if valid:
                 return hide
         if t - self._reach_t < PARAMS["reach_interval_s"]:
@@ -566,6 +587,12 @@ class Strategy:
         for m in obs["mechs"]:
             if m["kind"] == "npc":
                 self._npcs[m["id"]] = tuple(m["pos"][:2])
+        if self._npc_t == t and self._npc_by is not None:
+            if self._npc_by not in self._npcs:
+                est = self._npc_threat_point(obs)
+                if est is not None:
+                    self._npcs[self._npc_by] = tuple(est[:2])
+            self._retreat = (self._npc_by, t)
 
         phase = self._phase(obs, tracker)
         under_fire = t - self._hit_t <= PARAMS["under_fire_s"]
@@ -577,6 +604,7 @@ class Strategy:
         following_cover = False
 
         center, radius = tracker.safe_center_xy, tracker.safe_radius
+        retreat = self._retreat_move(obs, xy, center, radius, phase)
         if phase != "endgame" and me["in_zone"] and radius >= PARAMS["cover_min_radius_m"]:
             threats = self._mech_threats(xy, t)
             seen_now = any(tr.last_seen_t == t for tr in threats)
@@ -595,7 +623,8 @@ class Strategy:
                 # A fresh drone hit overrides the map's estimate of whether we are hidden.
                 hidden = bool(points) and t != self._npc_t and not self._exposed_to(obs, points)
                 if hidden and math.dist(xy, center) <= radius - PARAMS["hold_zone_margin_m"]:
-                    move = (0.0, 0.0)
+                    # D1: out of sight is not enough while still inside the drone's range.
+                    move = retreat if drone_only and retreat is not None else (0.0, 0.0)
                 elif drone_only:
                     move = self._npc_retreat(xy, npc, center, radius)
 
@@ -619,6 +648,8 @@ class Strategy:
         if move is None and drone_only:
             move = self._npc_retreat(xy, npc, center, radius, nearby=True)
         classic = self._classic(phase, radius)
+        if move is None and not points and retreat is not None:
+            move = retreat
         if move is None:
             if points:
                 exposers = points

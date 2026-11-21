@@ -64,5 +64,7 @@ PARAMS = {
     "stall_window_s": 1.5,
     "stall_progress_m": 1.0,         # stalled if under this progress toward the goal in stall_window_s
     "reach_interval_s": 3.0,         # F3(b): at most one reachability check per this many seconds
+    "retreat_clear_m": 60.0,         # D1: keep backing off a drone until this far from its last known spot
+    "retreat_max_s": 15.0,           # D1: give up a retreat this long after the last drone hit
     "drop_reject_m": 80.0,           # N5: no stage/hide this close to a called, untaken drop if any other remains
 }

@@ -416,6 +416,62 @@ class StrategyV3Test(unittest.TestCase):
                 patch.object(strat, "_reachable_route", return_value=[moved]):
             self.assertEqual(strat._nav_target(obs, strat.tracker, "hide"), moved)
 
+    def test_d1_retreat_continues_out_of_sight_until_60m_clear(self):
+        strat, obs = self.fresh(mechs=[], events=[], sounds=[], crates=[], cubes=[], drops=[], alive=16, t=30.0)
+        world = strat.tracker.world
+        p = tuple(obs["self"]["pos"][:2])
+        obs["self"]["in_zone"] = True
+        obs["zone"].update(next_center=list(p), next_radius=240.0)
+        n = (p[0] + 40.0, p[1])
+        first = copy.deepcopy(obs)
+        first["mechs"] = [_mech(104, (*n, world.ground_z(*n))) | {"kind": "npc", "hp": 350, "max_hp": 350}]
+        first["events"] = [{"type": "damaged", "amount": 25, "weapon": "npc", "by": 104, "bearing": 0.0}]
+        strat.act(first)
+        strat._exposed_to = lambda *a, **kw: False
+        moves = []
+        for k in range(1, 60):
+            o = copy.deepcopy(obs)
+            o["t"] = 30.0 + k * 0.1
+            o["tick"] = round(o["t"] * 20)
+            o["self"]["pos"] = [*p, world.ground_z(*p)]
+            mv = strat.act(o)["move"]
+            moves.append(mv)
+            q = (p[0] + mv[0] * strat.max_step, p[1] + mv[1] * strat.max_step)
+            if math.hypot(*mv) < 0.05:
+                break
+            if not world.blocked(*q):
+                p = q
+        self.assertGreater(math.dist(p, n), PARAMS["retreat_clear_m"])
+        self.assertIsNone(strat._retreat)
+
+    def test_d1_no_retreat_outside_the_zone(self):
+        strat, obs = self.fresh(mechs=[], events=[], alive=16, t=30.0)
+        x, y, _ = obs["self"]["pos"]
+        strat._npcs[104] = (x + 40.0, y)
+        strat._retreat = (104, 30.0)
+        obs["self"]["in_zone"] = False
+        center, radius = strat.tracker.safe_center_xy, strat.tracker.safe_radius
+        self.assertIsNone(strat._retreat_move(obs, (x, y), center, radius, "hide"))
+
+    def test_n5_new_drop_invalidates_committed_stage_and_hide(self):
+        strat, obs = self.fresh(mechs=[], sounds=[], cubes=[], crates=[], drops=[])
+        x, y, z = obs["self"]["pos"]
+        center = (x + 300.0, y)
+        obs["zone"].update(next_center=list(center), next_radius=240, shrink_start=100.0, shrink_end=150.0)
+        strat.tracker.update(obs)
+        stage = strat._stage_point(obs, strat.tracker, (x, y), center, 240)
+        obs["t"] += 0.1  # inside the commit window
+        obs["drops"] = [{"id": 20000, "pos": [stage[0], stage[1], z], "radius": 8, "lands_in": 10.0,
+                         "capture_s": 4, "progress": 0, "holder": None}]
+        moved = strat._stage_point(obs, strat.tracker, (x, y), center, 240)
+        self.assertGreaterEqual(math.dist(moved, stage), PARAMS["drop_reject_m"])
+        key = strat._zone_key(strat.tracker.safe_center_xy, strat.tracker.safe_radius)
+        strat._hide = (stage, obs["t"], moved, key)
+        with patch.object(strat, "_stage_point", return_value=moved), \
+                patch.object(strat.tracker.world, "best_hide", return_value=moved), \
+                patch.object(strat, "_reachable_route", return_value=[moved]):
+            self.assertEqual(strat._nav_target(obs, strat.tracker, "hide"), moved)
+
     def test_f3_reachability_check_is_rate_limited_after_rejections(self):
         strat, obs = self.fresh(mechs=[], sounds=[], cubes=[], crates=[], drops=[])
         x, y, z = obs["self"]["pos"]
