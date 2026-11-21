@@ -44,8 +44,9 @@ class Strategy:
         self._hit_t = -math.inf      # last time a mech (not zone, not unknown) damaged us
         self._hit_bearing = None     # world yaw toward that attacker, when the server gave one
         self._hit_by = None          # id of the mech that last damaged us
-        self._npc_hit_t = -math.inf
-        self._npc_hit_by = None
+        self._npc_t = -math.inf
+        self._npc_by = None
+        self._npc_bearing = None
         self._cover = None           # (goal_xy, chosen_t) committed hidden spot
         # Braking (survival-v3 item 3): full speed beyond one decision's walk, linear inside it.
         match = self.cfg["match"]
@@ -135,18 +136,35 @@ class Strategy:
         self._cover = (goal, t) if goal is not None else None
         return goal
 
-    def _strafe_goal(self, xy, exposers, center, radius, t):
-        """No cover in reach: step sideways across the line of fire instead of straight away.
-        Lasers are hitscan at the aim point and guns lead nothing, so the legs leave the beam while
-        combat keeps the torso on the attacker. Side flips every strafe period and at the circle edge."""
-        ex = min(exposers, key=lambda p: math.dist(xy, p[:2]))
+    def _npc_threat_point(self, obs):
+        for npc in obs["mechs"]:
+            if npc["kind"] == "npc" and npc["id"] == self._npc_by:
+                return npc["pos"]
+
+        if self._npc_bearing is None:
+            return None
+        x, y, z = obs["self"]["pos"]
+        distance = PARAMS["npc_bearing_range_m"]
+        px = x + distance * math.cos(self._npc_bearing)
+        py = y + distance * math.sin(self._npc_bearing)
+        world = self.tracker.world
+        return px, py, world.ground_z(px, py) if world is not None else z
+
+    def _evade_goal(self, xy, exposers, center, radius, t, npc=None):
+        """With no cover, back away from a drone or strafe across mech fire."""
+        ex = npc if npc is not None else min(exposers, key=lambda p: math.dist(xy, p[:2]))
         bearing = math.atan2(xy[1] - ex[1], xy[0] - ex[0])  # from attacker toward us
         side = 1.0 if (int(t / PARAMS["strafe_period_s"]) % 2 == 0) else -1.0
         inner = radius - PARAMS["hold_zone_margin_m"]
+        offset = PARAMS["strafe_offset_m"]
+        if npc is not None:
+            goal = (xy[0] + offset * math.cos(bearing), xy[1] + offset * math.sin(bearing))
+            if math.dist(goal, center) <= inner:
+                return goal
         for _ in range(2):
             px = -math.sin(bearing) * side
             py = math.cos(bearing) * side
-            goal = (xy[0] + px * PARAMS["strafe_offset_m"], xy[1] + py * PARAMS["strafe_offset_m"])
+            goal = (xy[0] + px * offset, xy[1] + py * offset)
             if math.dist(goal, center) <= inner:
                 return goal
             side = -side
@@ -226,9 +244,9 @@ class Strategy:
         if mechs:
             target = min(mechs, key=lambda m: math.dist(me["pos"], m["pos"]))
             return True, target["id"]
-        if obs["t"] - self._npc_hit_t <= PARAMS["under_fire_s"]:
+        if obs["t"] - self._npc_t <= PARAMS["under_fire_s"]:
             for npc in obs["mechs"]:
-                if npc["kind"] == "npc" and npc["id"] == self._npc_hit_by:
+                if npc["kind"] == "npc" and npc["id"] == self._npc_by:
                     return True, npc["id"]
         if phase == "loot" and not under_fire and not tracker.enemies and me["in_zone"] and obs["crates"]:
             crate = min(obs["crates"], key=lambda c: math.dist(xy, c["pos"][:2]))
@@ -251,12 +269,16 @@ class Strategy:
                 self._hit_t = t
                 self._hit_bearing = e.get("bearing")
                 self._hit_by = by
-            elif 100 <= by < 1000:  # protocol NPC IDs; remember separately for return fire only
-                self._npc_hit_t = t
-                self._npc_hit_by = by
+            elif 100 <= by < 1000:  # protocol NPC IDs
+                if by != self._npc_by or t - self._npc_t > PARAMS["under_fire_s"]:
+                    self._cover = None
+                self._npc_t = t
+                self._npc_by = by
+                self._npc_bearing = e.get("bearing")
 
         phase = self._phase(obs, tracker)
         under_fire = t - self._hit_t <= PARAMS["under_fire_s"]
+        npc_fire = t - self._npc_t <= PARAMS["under_fire_s"]
         hold = False
         threat_goal = None
 
@@ -264,7 +286,7 @@ class Strategy:
         if phase != "endgame" and me["in_zone"] and radius >= PARAMS["cover_min_radius_m"]:
             threats = self._mech_threats(xy, t)
             seen_now = any(tr.last_seen_t == t for tr in threats)
-            if threats or under_fire:
+            if threats or under_fire or npc_fire:
                 points = [tr.pos for tr in threats]
                 if not points and under_fire and self._hit_bearing is not None:
                     # Shot from outside sight: treat the bearing as a threat 40 m out.
@@ -272,18 +294,23 @@ class Strategy:
                     px, py = xy[0] + 40.0 * math.cos(b), xy[1] + 40.0 * math.sin(b)
                     if self.tracker.world is not None:
                         points = [(px, py, self.tracker.world.ground_z(px, py))]
-                if under_fire or seen_now:
-                    # Hold only when we know where the threat is and it cannot see us.
-                    hidden = bool(points) and not self._exposed_to(obs, points)
+                npc = self._npc_threat_point(obs) if npc_fire else None
+                if npc is not None:
+                    points.append(npc)
+                if under_fire or seen_now or npc_fire:
+                    # A fresh drone hit overrides the map's estimate of whether we are hidden.
+                    hidden = bool(points) and t != self._npc_t and not self._exposed_to(obs, points)
                     if hidden and math.dist(xy, center) <= radius - PARAMS["hold_zone_margin_m"]:
                         hold = True          # hidden and inside the circle: stand still, silent
                         self._cover = None
                     else:
                         threat_goal = self._threat_goal(xy, points, center, radius, t)
-                        if threat_goal is None:
-                            exposers = [p for p in points if self._exposed_to(obs, [p])] or points
+                        if threat_goal is None or (npc is not None and threat_goal == xy):
+                            exposers = points
+                            if npc is None:
+                                exposers = [p for p in points if self._exposed_to(obs, [p])] or points
                             if exposers:
-                                threat_goal = self._strafe_goal(xy, exposers, center, radius, t)
+                                threat_goal = self._evade_goal(xy, exposers, center, radius, t, npc=npc)
 
         if hold:
             goal = xy
@@ -334,8 +361,11 @@ class Strategy:
                     action["pick"] = out.pick
 
         # Keep the torso facing the attacker while we move, so the hit does not count as a rear hit.
-        if not combat_aimed and under_fire and self._hit_bearing is not None:
-            action["aim"] = [self._hit_bearing, 0.0]
+        if not combat_aimed:
+            if under_fire and self._hit_bearing is not None:
+                action["aim"] = [self._hit_bearing, 0.0]
+            elif npc_fire and self._npc_bearing is not None:
+                action["aim"] = [self._npc_bearing, 0.0]
 
         if obs["offer"] is not None and "pick" not in action:
             action["pick"] = 0  # cheap default if combat didn't already choose (server times out to 0 anyway)

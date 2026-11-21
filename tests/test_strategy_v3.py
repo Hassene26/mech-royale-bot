@@ -111,6 +111,42 @@ class StrategyV3Test(unittest.TestCase):
         obs["t"] += 5.0
         self.assertEqual(self.plan(strat, obs), (False, None))
 
+    def test_backs_out_of_drone_range_while_returning_fire_in_hide_phase(self):
+        strat, obs = self.fresh(t=70.0, sounds=[], crates=[], cubes=[], pickups=[])
+        # An open field with no cover. The arena kinematic probe also checks
+        # actual cover and collision geometry across varied drone placements.
+        strat.tracker.world = None
+        x, y, z = obs["self"]["pos"]
+        obs["zone"].update(next_center=[x, y], next_radius=380, shrink_start=100.0, shrink_end=150.0)
+        drone = _mech(104, (x + 30.0, y, z)) | {"kind": "npc", "hp": 350, "max_hp": 350}
+        drone_xy = drone["pos"][:2]
+        muzzle_to_center = self.hello["config"]["npc"]["height"] / 2 - obs["self"]["stats"]["muzzle_height"]
+        match = self.hello["config"]["match"]
+        decision_s = match["decide_every"] / match["tick_hz"]
+        drone_range = self.hello["config"]["npc"]["aggro_range"]
+
+        for step in range(round(5.0 / decision_s)):
+            obs["t"] = 70.0 + step * decision_s
+            obs["tick"] = round(obs["t"] * match["tick_hz"])
+            obs["mechs"] = [drone]
+            obs["events"] = []
+            if step % round(1.0 / decision_s) == 0:
+                obs["events"] = [{"type": "damaged", "amount": 25, "weapon": "npc", "by": 104, "bearing": 0.0}]
+            me = obs["self"]
+            me["aim"] = [0.0, math.atan2(muzzle_to_center, math.dist(me["pos"][:2], drone_xy))]
+            action = strat.act(obs)
+            self.assertEqual(strat._phase(obs, strat.tracker), "hide")
+            self.assertEqual(strat._hit_t, -math.inf)
+            self.assertTrue(action["fire"][0])
+            dx, dy = action["move"]
+            self.assertLess(dx, 0.0)
+            self.assertAlmostEqual(dy, 0.0)
+            me["pos"] = [me["pos"][0] + dx * strat.max_step, me["pos"][1] + dy * strat.max_step, z]
+            if math.dist(me["pos"][:2], drone_xy) > drone_range:
+                break
+
+        self.assertGreater(math.dist(obs["self"]["pos"][:2], drone_xy), drone_range)
+
     def test_hidden_attacker_falls_back_to_visible_mech(self):
         strat, obs = self.fresh()
         me = obs["self"]["pos"]

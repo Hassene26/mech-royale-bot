@@ -16,11 +16,12 @@ PARAMS = {
 
     # --- survival-v3 threat response (mech-strategy, COMMS 2026-11-21 00:33) ---
     "threat_memory_s": 5.0,          # enemy mech stays a threat this long after last seen (vision.memory_s)
-    "under_fire_s": 4.0,             # return-fire window; mech damage also triggers cover and facing
+    "under_fire_s": 4.0,             # cover, return fire and facing after a hit
+    "npc_bearing_range_m": 30.0,     # estimated distance when the attacking drone is out of sight
     "cover_radius_m": 24.0,          # search radius around our own position for a hidden spot
     "cover_far_radius_m": 60.0,      # wider second search when nothing hidden is within cover_radius_m
     "strafe_period_s": 1.5,          # with no cover in reach, legs flip side this often (across the line of fire)
-    "strafe_offset_m": 10.0,         # sideways step length of one strafe goal
+    "strafe_offset_m": 10.0,         # lookahead distance for a strafe or drone retreat
     "cover_zone_margin_m": 6.0,      # cover spots stay this far inside the next circle
     "cover_commit_s": 1.2,           # keep a chosen hidden spot this long before re-choosing
     "cover_reach_m": 1.5,            # close enough to a hidden spot to choose again
