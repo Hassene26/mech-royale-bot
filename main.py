@@ -1,69 +1,84 @@
-"""Mechfight protocol entrypoint with a zone-walk fallback."""
-
+"""Entrypoint: mf.run(Bot). Crash-proof (Strategy construction and every act() call are guarded) and
+time-guarded (a SIGALRM hard deadline aborts a slow decision before the server's 50ms budget is hit).
+Always returns a valid action: falls back to a simple zone-walk when Strategy is unavailable, errors,
+or overruns its budget. Owned by mech-strategy."""
 import math
 import signal
-import threading
-import time
+import traceback
 
 import mechfight as mf
 
+try:
+    from strategy import Strategy
+except Exception:
+    Strategy = None
 
-class DecisionTimeout(BaseException):
-    pass
+TICK_BUDGET_S = 0.05      # protocol's tick_budget_ms
+ALARM_BUDGET_S = 0.035    # hard backstop well under the wall-clock budget (steady-state target < 15ms)
+_HAS_ALARM = hasattr(signal, "setitimer") and hasattr(signal, "SIGALRM")
 
 
-def _handle_timeout(signum, frame):
-    raise DecisionTimeout
+class _Timeout(BaseException):
+    """Alarm must not be swallowed by `except Exception` inside nav or combat."""
+
+
+def _on_alarm(signum, frame):
+    raise _Timeout()
+
+
+def _fallback_action(obs):
+    """Zone-walk: move toward the next safe circle, boosting if already taking zone damage."""
+    me = obs["self"]
+    x, y, _ = me["pos"]
+    gx, gy = obs["zone"]["next_center"]
+    yaw = math.atan2(gy - y, gx - x)
+    return {"tick": obs["tick"], "move": [math.cos(yaw), math.sin(yaw)],
+            "aim": [yaw, 0.0], "boost": not me["in_zone"]}
 
 
 class Bot:
-    name = "placement-v1"
+    name = "mech-strategy"
 
-    def __init__(self, hello):
+    def __init__(self, hello: mf.Hello):
         self.strategy = None
-        self.timer_enabled = hasattr(signal, "setitimer") and threading.current_thread() is threading.main_thread()
+        if Strategy is None:
+            return
         try:
-            from params import PARAMS
-            from strategy import Strategy
-
-            if self.timer_enabled:
-                signal.signal(signal.SIGALRM, _handle_timeout)
-            self.budget = min(PARAMS["tick_budget_s"], 0.7 * hello["config"]["bot"]["tick_budget_ms"] / 1000)
             self.strategy = Strategy(hello)
-        except Exception as exc:
-            mf.log("Strategy initialization failed:", exc)
-        self.reported_error = False
+        except Exception:
+            mf.log("Strategy() failed, falling back to zone-walk for the whole match:\n" + traceback.format_exc())
+            self.strategy = None
 
-    def act(self, obs):
-        started = time.monotonic()
-        fallback = {"tick": obs["tick"]}
+    def act(self, obs: mf.Observation) -> mf.Action:
+        if self.strategy is None:
+            return _fallback_action(obs)
+        # Outer guard: the alarm is only armed inside _guarded_act, but it can still fire in its
+        # finally clause or in the logging below. Catching _Timeout here keeps the process alive.
         try:
-            x, y, _ = obs["self"]["pos"]
-            gx, gy = obs["zone"]["next_center"]
-            distance = math.hypot(gx - x, gy - y)
-            fallback["move"] = [(gx - x) / distance, (gy - y) / distance] if distance else [0.0, 0.0]
-            if self.strategy is None:
-                return fallback
-            try:
-                if self.timer_enabled:
-                    remaining = self.budget - (time.monotonic() - started)
-                    if remaining <= 0:
-                        return fallback
-                    signal.setitimer(signal.ITIMER_REAL, remaining)
-                action = self.strategy.act(obs)
-            finally:
-                if self.timer_enabled:
-                    signal.setitimer(signal.ITIMER_REAL, 0)
-            if time.monotonic() - started < self.budget:
+            return self._guarded_act(obs)
+        except _Timeout:
+            mf.log(f"tick {obs.get('tick')}: strategy.act exceeded {ALARM_BUDGET_S * 1000:.0f}ms, using fallback")
+        except Exception:
+            mf.log(f"tick {obs.get('tick')}: act failed:\n" + traceback.format_exc())
+        return _fallback_action(obs)
+
+    def _guarded_act(self, obs: mf.Observation) -> mf.Action:
+        old_handler = None
+        if _HAS_ALARM:
+            old_handler = signal.signal(signal.SIGALRM, _on_alarm)
+            signal.setitimer(signal.ITIMER_REAL, ALARM_BUDGET_S)
+        try:
+            action = self.strategy.act(obs)
+            if isinstance(action, dict) and "tick" in action:
                 return action
-        except DecisionTimeout:
-            pass
-        except Exception as exc:
-            if not self.reported_error:
-                mf.log("Strategy decision failed:", exc)
-                self.reported_error = True
-        return fallback
+            mf.log(f"tick {obs.get('tick')}: strategy.act returned {action!r}, using fallback")
+        finally:
+            if _HAS_ALARM:
+                try:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                finally:
+                    signal.signal(signal.SIGALRM, old_handler)
+        return _fallback_action(obs)
 
 
-if __name__ == "__main__":
-    mf.run(Bot)
+mf.run(Bot)
