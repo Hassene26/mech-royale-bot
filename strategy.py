@@ -269,17 +269,12 @@ class Strategy:
 
     # --- fire discipline -------------------------------------------------
     def _fire_plan(self, obs, tracker, phase, under_fire):
-        """Authorize a shot at a visible attacker or the nearest visible mech."""
+        """Authorize visible-mech fire regardless of the movement state."""
         me = obs["self"]
         xy = me["pos"][:2]
-        mechs = [m for m in obs["mechs"] if m["kind"] == "mech"]
-        if under_fire:
-            attacker = next((m for m in mechs if m["id"] == self._hit_by), None)
-            if attacker is not None:
-                return True, attacker["id"]  # return fire at the visible mech that hurt us
-        if mechs:
-            target = min(mechs, key=lambda m: math.dist(me["pos"], m["pos"]))
-            return True, target["id"]
+        if any(m["kind"] == "mech" for m in obs["mechs"]):
+            # Combat chooses among targets with a legal shot for a held weapon.
+            return True, None
         if obs["t"] - self._npc_t <= PARAMS["under_fire_s"]:
             for npc in obs["mechs"]:
                 if npc["kind"] == "npc" and npc["id"] == self._npc_by:
@@ -289,6 +284,20 @@ class Strategy:
             if math.dist(xy, crate["pos"][:2]) <= PARAMS["crate_fire_range_m"]:
                 return True, crate["id"]  # farming a near crate with no threat known
         return False, None
+
+    def _threat_yaw(self, xy, under_fire, npc_fire):
+        """Face the nearest confirmed contact while neither weapon needs an aim."""
+        # Tracker prunes stale contacts before act computes aim. Do not cap contact
+        # memory at base visual range, since sensors can increase actual sight.
+        contacts = (tr for tr in self.tracker.enemies.values() if not tr.ghost)
+        nearest = min(contacts, key=lambda tr: math.dist(xy, tr.pos[:2]), default=None)
+        if nearest is not None:
+            return math.atan2(nearest.pos[1] - xy[1], nearest.pos[0] - xy[0])
+        if under_fire and self._hit_bearing is not None:
+            return self._hit_bearing
+        if npc_fire:
+            return self._npc_bearing
+        return None
 
     def act(self, obs):
         tracker = self.tracker
@@ -410,12 +419,10 @@ class Strategy:
                 if out.pick is not None:
                     action["pick"] = out.pick
 
-        # Keep the torso facing the attacker while we move, so the hit does not count as a rear hit.
         if not combat_aimed:
-            if under_fire and self._hit_bearing is not None:
-                action["aim"] = [self._hit_bearing, 0.0]
-            elif npc_fire and self._npc_bearing is not None:
-                action["aim"] = [self._npc_bearing, 0.0]
+            threat_yaw = self._threat_yaw(xy, under_fire, npc_fire)
+            if threat_yaw is not None:
+                action["aim"] = [threat_yaw, 0.0]
 
         if obs["offer"] is not None and "pick" not in action:
             action["pick"] = 0  # cheap default if combat didn't already choose (server times out to 0 anyway)
