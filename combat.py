@@ -24,6 +24,7 @@ class Combat:
         self.laser_point = None
         priority = ("mech.hp", "mech.regen_per_s", "mech.regen_delay", "mech.armor", "mech.walk_speed",
                     "mech.energy_regen", "mech.energy", "mech.boost_drain")
+        self.upgrade_weapon = {u["id"]: u["requires"] for u in self.cfg["upgrades"] if u.get("requires")}
         self.upgrades = {
             u["id"]: min((priority.index(e["path"]) for e in u["effects"]
                           if e["path"] in priority), default=len(priority))
@@ -56,8 +57,8 @@ class Combat:
         def value(kind):
             return (COUNTERS.get(kind) in threats, kind in COUNTERS)
 
-        candidates = [p for p in obs["pickups"] if p["kind"] in COUNTERS
-                      and p["kind"] not in held and abs(p["pos"][2] - me["pos"][2]) <= 4
+        candidates = [p for p in obs["pickups"] if p["kind"] in self.cfg["weapons"]
+                      and (p["kind"] not in held or (p["kind"] == "gun" and None in slots)) and abs(p["pos"][2] - me["pos"][2]) <= 4
                       and math.dist(me["pos"][:2], p["pos"][:2]) <= self.cfg["loot"]["pickup_radius"]]
         if candidates:
             best = max(candidates, key=lambda p: value(p["kind"]))
@@ -69,7 +70,13 @@ class Combat:
                     out.take, out.drop = best["id"], slot
         choices = (obs.get("offer") or {}).get("choices", [])
         if choices:
-            out.pick = min(range(len(choices)), key=lambda i: self.upgrades.get(choices[i]["id"], math.inf))
+            def offer_value(choice):
+                upgrade = choice["id"]
+                weapon = self.upgrade_weapon.get(upgrade)
+                counter = weapon in held and COUNTERS.get(weapon) in threats
+                return (not counter, self.upgrades.get(upgrade, math.inf))
+
+            out.pick = min(range(len(choices)), key=lambda i: offer_value(choices[i]))
 
     def _target_size(self, target):
         kind = target.get("kind")
@@ -182,6 +189,28 @@ class Combat:
             best = min(best, max(ready, turn) + (shots - 1) * interval + flight)
         return best
 
+    def _weapon_options(self, me, target, tracker, allow_fire, out):
+        options = []
+        for i, slot in enumerate(me["weapons"]):
+            if not slot or i == out.drop:
+                continue
+            kind = slot["kind"]
+            stats = self.cfg["weapons"][kind] | slot.get("stats", {})
+            if kind == "gun":
+                ammo = slot.get("ammo", stats["mag"])
+                out.reload = not slot.get("reload") and (ammo == 0 or (not target and ammo < stats["mag"]))
+                if not ammo or slot.get("reload"):
+                    continue
+            if not target or not allow_fire or slot.get("cooldown", 0) >= self.step:
+                continue
+            if kind == "lightning" and me["energy"] < stats["energy"]:
+                continue
+            shot = self._shot(me, target, kind, stats, tracker)
+            if shot:
+                priority = (bool(slot.get("charge")), COUNTERS.get(kind) in target.get("weapons", ()), stats["damage"])
+                options.append((priority, i, shot, kind, stats))
+        return options
+
     def decide(self, obs, tracker, intent):
         """Select the best-scoring visible enemy even below zero. Strategy gates fire via allow_fire."""
         me = obs["self"]
@@ -191,14 +220,13 @@ class Combat:
         self._loot(obs, enemies, out)
         rear = next((e.get("bearing") for e in reversed(obs["events"])
                      if e["type"] == "damaged" and e.get("rear") and e.get("bearing") is not None), None)
-        if rear is not None:
-            out.aim = [rear, me["aim"][1]]
         requested = intent.get("target_id")
         if requested is not None:
             target = next((m for m in obs["mechs"] + obs["crates"] if m["id"] == requested), None)
         farm = not enemies and me["in_zone"] and not getattr(tracker, "enemies", {}) and rear is None
         if target is None and requested is None and farm and intent.get("loot_priority"):
-            target = min(obs["crates"] + obs["mechs"], key=lambda m: math.dist(m["pos"], me["pos"]), default=None)
+            near = [m for m in obs["crates"] + obs["mechs"] if math.dist(m["pos"], me["pos"]) <= 35]
+            target = min(near, key=lambda m: math.dist(m["pos"], me["pos"]), default=None)
         if target and target.get("kind") != "mech" and not farm:
             if not (target.get("kind") == "npc" and requested == target["id"]
                     and intent.get("allow_fire") is True):
@@ -226,33 +254,40 @@ class Combat:
                 out.fire[laser] = (abs(math.remainder(out.aim[0] - me["aim"][0], math.tau)) > tolerance
                                    or abs(out.aim[1] - me["aim"][1]) > tolerance)
                 return out
-        options = []
-        for i, slot in enumerate(me["weapons"]):
-            if not slot or i == out.drop:
-                continue
-            kind = slot["kind"]
-            stats = self.cfg["weapons"][kind] | slot.get("stats", {})
-            if kind == "gun":
-                ammo = slot.get("ammo", stats["mag"])
-                out.reload = not slot.get("reload") and (ammo == 0 or (not target and ammo < stats["mag"]))
-                if not ammo or slot.get("reload"):
+        allow_fire = intent.get("allow_fire", True)
+        options = self._weapon_options(me, target, tracker, allow_fire, out)
+        if not options and allow_fire and requested is None and len(enemies) > 1:
+            for _, other in sorted(enemies, key=lambda pair: pair[0], reverse=True):
+                if other is target:
                     continue
-            if not target or not intent.get("allow_fire", True) or slot.get("cooldown", 0) >= self.step:
-                continue
-            if kind == "lightning" and me["energy"] < stats["energy"]:
-                continue
-            shot = self._shot(me, target, kind, stats, tracker)
-            if shot:
-                priority = (bool(slot.get("charge")), COUNTERS.get(kind) in target.get("weapons", ()), stats["damage"])
-                options.append((priority, i, shot, kind, stats))
+                options = self._weapon_options(me, other, tracker, allow_fire, out)
+                if options:
+                    target = other
+                    break
         if options:
-            _, i, (out.aim, aligned, _), kind, stats = max(options)
-            if kind == "laser":
-                height, radius = self._target_size(target)
-                x, y, z = target["pos"]
-                self.laser_point = target["id"], (x, y, z + height / 2), radius
-                charge = me["weapons"][i].get("charge", 0)
-                out.fire[i] = (aligned or charge > 0) and not (aligned and charge >= stats["charge"])
-            else:
-                out.fire[i] = aligned
+            primary = max(options)
+            out.aim = primary[2][0]
+            for _, i, (aim, aligned, flight), kind, stats in options:
+                if i != primary[1]:
+                    if target.get("kind") != "mech":
+                        continue
+                    # Both slots share a torso. The second solution must still
+                    # hit when the torso reaches the primary weapon's direction.
+                    _, radius = self._target_size(target)
+                    tolerance = math.atan2(radius, max(1.0, math.dist(me["pos"], target["pos"])
+                                                      + math.hypot(*target.get("vel", (0, 0, 0))) * flight))
+                    yaw = abs(math.remainder(out.aim[0] - aim[0], math.tau))
+                    if kind == "lightning":
+                        aligned = aligned and yaw <= math.radians(stats["cone_deg"])
+                    else:
+                        aligned = aligned and yaw <= tolerance and abs(out.aim[1] - aim[1]) <= tolerance
+                if kind == "laser":
+                    charge = me["weapons"][i].get("charge", 0)
+                    if aligned or charge:
+                        height, radius = self._target_size(target)
+                        x, y, z = target["pos"]
+                        self.laser_point = target["id"], (x, y, z + height / 2), radius
+                    out.fire[i] = (aligned or charge > 0) and not (aligned and charge >= stats["charge"])
+                else:
+                    out.fire[i] = aligned
         return out
