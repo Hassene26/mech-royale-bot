@@ -177,6 +177,47 @@ class StrategyV3Test(unittest.TestCase):
         self.assertIsNone(strat._cover)
         self.assertGreater(strat._cover_retry_t, obs["t"])
 
+    def test_drone_retreat_does_not_follow_cover_toward_drone(self):
+        """R1 regression (mech-review 06:02, npc_probe_c3 seed 5 trial 5): the cover route to
+        (81, -36) first led toward the drone, and cand-3 took 8.6 s and 225 damage to escape."""
+        strat, obs0 = self.fresh(t=70.0, sounds=[], crates=[], cubes=[], pickups=[], mechs=[], events=[])
+        world = strat.tracker.world
+        p = (37.655664433277, -55.78682724749681)
+        n = (19.97542961559453, -34.73752422955869)
+        drone_eye = (n[0], n[1], world.ground_z(*n) + 2.0)
+        hp, aim, escape_t = 1400, list(obs0["self"]["aim"]), None
+        for k in range(100):  # 10 s of decisions; the target is under 5 s
+            t = 70.0 + k * 0.1
+            me = (p[0], p[1], world.ground_z(*p))
+            exposed = world.visible(drone_eye, None, me) and math.dist(n, p) <= 45
+            if not exposed:
+                escape_t = k * 0.1
+                break
+            obs = copy.deepcopy(obs0)
+            obs.update(t=t, tick=int(t * 20))
+            obs["self"].update(pos=list(me), hp=hp, aim=aim)
+            obs["mechs"] = [_mech(104, (n[0], n[1], world.ground_z(*n))) | {"kind": "npc", "hp": 350, "max_hp": 350}]
+            if k % 10 == 0:
+                hp -= 25
+                obs["events"] = [{"type": "damaged", "amount": 25, "weapon": "npc", "by": 104,
+                                  "bearing": math.atan2(n[1] - p[1], n[0] - p[0]), "rear": False}]
+            action = strat.act(obs)
+            aim = action["aim"]
+            dx, dy = action["move"]
+            self.assertGreater(math.hypot(dx, dy), 0.05, "froze in drone fire at t=%.1f" % t)
+            self.assertGreaterEqual(dx * (p[0] - n[0]) + dy * (p[1] - n[1]), 0.0,
+                                    "moved toward the drone at t=%.1f" % t)
+            q = (p[0] + dx * strat.max_step, p[1] + dy * strat.max_step)
+            if not world.blocked(*q):
+                p = q
+        self.assertIsNotNone(escape_t, "still exposed to the drone after 10 s")
+        self.assertLess(escape_t, 5.0)
+
+    def test_toward_drone_sign(self):
+        self.assertTrue(Strategy._toward_drone((0.0, 0.0), (1.0, 0.0), (10.0, 0.0)))
+        self.assertFalse(Strategy._toward_drone((0.0, 0.0), (-1.0, 0.0), (10.0, 0.0)))
+        self.assertFalse(Strategy._toward_drone((0.0, 0.0), (0.0, 1.0), (10.0, 0.0)))
+
     def test_hidden_attacker_falls_back_to_visible_mech(self):
         strat, obs = self.fresh()
         me = obs["self"]["pos"]

@@ -193,6 +193,12 @@ class Strategy:
                 return dx, dy
         return None
 
+    @staticmethod
+    def _toward_drone(xy, move, npc):
+        """True when the move has a negative component along the away-from-drone direction."""
+        ax, ay = xy[0] - npc[0], xy[1] - npc[1]
+        return move[0] * ax + move[1] * ay < 0.0
+
     def _cover_stalled(self, xy, move):
         if math.hypot(*move) < PARAMS["cover_stall_move"]:
             return True
@@ -343,6 +349,11 @@ class Strategy:
                     if goal is not None:
                         move = self._move_toward(obs, tracker, goal)
                         if (under_fire or npc_fire) and self._cover_stalled(xy, move):
+                            move = None
+                            self._cover_retry_t = t + PARAMS["cover_commit_s"]
+                        elif drone_only and self._toward_drone(xy, move, npc):
+                            # R1: a cover route that first closes on the drone keeps us in its
+                            # fire; side-step away instead and retry cover after the commit time.
                             move = None
                             self._cover_retry_t = t + PARAMS["cover_commit_s"]
                         else:
