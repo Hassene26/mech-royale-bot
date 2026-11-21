@@ -55,6 +55,7 @@ class Strategy:
         self._banned_key, self._banned = None, []   # F3: stalled/unreachable spots per zone phase
         self._escape = None          # zone key while heading for the next centre after a ban
         self._prog = None            # (goal_xy, t0, dist0) progress check for normal navigation
+        self._reach_t = -math.inf    # last 20 ms reachability route check
         self._npcs = {}              # drone id -> last seen xy
         self.near_range_m = self.cfg["vision"].get("near_range", 45.0)
         # Braking (survival-v3 item 3): full speed beyond one decision's walk, linear inside it.
@@ -271,11 +272,18 @@ class Strategy:
         b0 = math.atan2(dy, dx) if (dx or dy) else 0.0
         best, best_cost = None, math.inf
         step = PARAMS["stage_arc_step_rad"]
+        candidates = []
         for k in range(-PARAMS["stage_arc_steps"], PARAMS["stage_arc_steps"] + 1):
             b = b0 + k * step
             p = (center[0] + inner * math.cos(b), center[1] + inner * math.sin(b))
-            if self._is_banned(key, p):
-                continue
+            if not self._is_banned(key, p):
+                candidates.append(p)
+        clear = [p for p in candidates if not self._near_drop(obs, p)]
+        if clear:
+            candidates = clear
+            if old is not None and self._near_drop(obs, old):
+                old = None
+        for p in candidates:
             cost = self._stage_cost(obs, tracker, xy, p)
             if cost < best_cost:
                 best, best_cost = p, cost
@@ -288,23 +296,49 @@ class Strategy:
         self._stage = (best, t, key)
         return best
 
-    def _reachable(self, xy, goal):
-        """F3(b): a full route no longer than 1.5 x the straight line + 20 m (20 ms budget)."""
+    @staticmethod
+    def _near_drop(obs, p):
+        """N5: True within drop_reject_m of a called, not yet taken supply drop."""
+        return any(d.get("pos") is not None
+                   and math.dist(p[:2], d["pos"][:2]) < PARAMS["drop_reject_m"]
+                   for d in obs.get("drops") or ())
+
+    def _route_drone(self, start, end):
+        """Find a known drone whose aggro buffer this segment enters or moves farther into."""
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        length_sq = dx * dx + dy * dy
+        if not length_sq:
+            return None
+        for npc in self._npcs.values():
+            nx, ny = npc[0] - start[0], npc[1] - start[1]
+            projection = (nx * dx + ny * dy) / length_sq
+            if projection <= 0.0:
+                continue
+            fraction = min(projection, 1.0)
+            limit = min(PARAMS["route_npc_clearance_m"], math.hypot(nx, ny))
+            if math.hypot(nx - fraction * dx, ny - fraction * dy) < limit - 0.05:
+                return npc
+        return None
+
+    def _reachable_route(self, xy, goal):
+        """Return a full route within the allowed detour, or None."""
         world = self.tracker.world
         if world is None:
-            return True
+            return [goal]
         try:
             route = world.path(xy, goal, budget_ms=PARAMS["reach_budget_ms"])
         except Exception:
-            return True
+            return [goal]
         if not route or math.dist(route[-1], goal[:2]) > PARAMS["reach_end_tol_m"]:
-            return False
+            return None
         length, prev = 0.0, xy
         for pt in route:
             length += math.dist(prev, pt[:2])
             prev = pt[:2]
         straight = math.dist(xy, goal[:2])
-        return length <= PARAMS["reach_detour_mult"] * straight + PARAMS["reach_detour_add_m"]
+        if length > PARAMS["reach_detour_mult"] * straight + PARAMS["reach_detour_add_m"]:
+            return None
+        return route
 
     def _nav_target(self, obs, tracker, phase):
         """cand-10 evasion: no crate detours; a cube only when very close and no mech in sight.
@@ -318,6 +352,8 @@ class Strategy:
         key = self._zone_key(center, radius)
         if radius <= 0.5:
             return center
+        if self._classic(phase, radius):
+            return self._classic_target(xy, tracker, phase)
         margin = min(max(radius * PARAMS["edge_margin_frac"], PARAMS["edge_margin_min_m"]),
                      PARAMS["edge_margin_max_m"])
         if self._escape is not None:
@@ -348,6 +384,9 @@ class Strategy:
                      and not (sighted and t - chosen >= PARAMS["hide_commit_s"]))
             if valid:
                 return hide
+        if t - self._reach_t < PARAMS["reach_interval_s"]:
+            # F3(b): one 20 ms route check per interval; head for the stage point meanwhile.
+            return stage
         goal = stage
         world = tracker.world
         if world is not None:
@@ -360,12 +399,52 @@ class Strategy:
                 if not self.reported_hide_error:
                     log("Cover selection failed, using the stage point:", exc)
                     self.reported_hide_error = True
-        if not self._reachable(xy, goal):
+        if goal != stage and self._near_drop(obs, goal) and not self._near_drop(obs, stage):
+            goal = stage
+        self._reach_t = t
+        route = self._reachable_route(xy, goal)
+        if route is None:
             self._ban(key, goal, stage if stage != center else None)
             self._escape = key if stage == center else None
             return center
+        if self._npcs and obs["self"]["in_zone"] and math.dist(xy, center) <= zone_r:
+            start = xy
+            for waypoint in (*route, goal):
+                if self._route_drone(start, waypoint) is not None:
+                    # Stay inside the next circle without crossing the drone's aggro range.
+                    goal = xy
+                    break
+                start = waypoint
         self._hide = (goal, t, stage, key)
         return goal
+
+    @staticmethod
+    def _classic(phase, radius):
+        """N1: endgame (few alive) or a tiny circle keeps cand-6 movement unchanged."""
+        return phase == "endgame" or radius < PARAMS["cover_min_radius_m"]
+
+    def _classic_target(self, xy, tracker, phase):
+        """cand-6 _nav_target without its loot detour: centre in the endgame, else nearby cover."""
+        center, radius = tracker.safe_center_xy, tracker.safe_radius
+        if phase == "endgame":
+            return center
+        inner = max(0.0, radius - PARAMS["cover_zone_margin_m"])
+        locally_safe = inner > 0 and math.dist(xy, center) <= inner
+        search_center = xy if locally_safe else center
+        search_radius = PARAMS["cover_radius_m"] if locally_safe else PARAMS["hide_search_radius_m"]
+        threats = [tr.pos[:2] for tr in tracker.enemies.values()]
+        if tracker.world is not None:
+            try:
+                goal = tracker.world.best_hide(
+                    search_center, min(search_radius, radius), threats,
+                    zone_next=(center, inner if locally_safe else radius), me_xy=xy,
+                )
+                return (float(goal[0]), float(goal[1]))
+            except Exception as exc:
+                if not self.reported_hide_error:
+                    log("Cover selection failed, using the search center:", exc)
+                    self.reported_hide_error = True
+        return search_center
 
     def _stalled_nav(self, xy, goal, move, t):
         """F3(a): no move while the goal is > 2 m away, or < 1 m progress in 1.5 s."""
@@ -426,16 +505,19 @@ class Strategy:
         return outside / walk > left - PARAMS["deadline_slack_s"]
 
     # --- fire discipline -------------------------------------------------
-    def _fire_plan(self, obs, tracker, phase, under_fire):
-        """cand-10 evasion: never start a fight. Fire only back at the mech that hit us in the
-        last under_fire_s, and only while it is visible (a specific target_id, so combat cannot
-        fall through to another mech). In the endgame (few left, the circle forces contact) also
-        fire at a mech within near_range or one charging a laser. No drone or crate fire."""
+    def _fire_plan(self, obs, tracker, phase, under_fire, npc_fire=False):
+        """cand-10 evasion: never start a fight. Fire only back at the mech or drone that hit us
+        in the last under_fire_s, and only while it is visible (a specific target_id, so combat
+        cannot fall through to another target); the mech attacker comes first. In the endgame
+        (few left, the circle forces contact) also fire at a mech within near_range or one
+        charging a laser. No fire at idle drones or crates."""
         me = obs["self"]
         xy = me["pos"][:2]
         mechs = [m for m in obs["mechs"] if m["kind"] == "mech"]
         if under_fire and any(m["id"] == self._hit_by for m in mechs):
             return True, self._hit_by
+        if npc_fire and any(m["kind"] == "npc" and m["id"] == self._npc_by for m in obs["mechs"]):
+            return True, self._npc_by
         if phase == "endgame":
             near = [m for m in mechs
                     if m.get("charging") or math.dist(xy, m["pos"][:2]) <= self.near_range_m]
@@ -536,6 +618,7 @@ class Strategy:
             self._cover = None
         if move is None and drone_only:
             move = self._npc_retreat(xy, npc, center, radius, nearby=True)
+        classic = self._classic(phase, radius)
         if move is None:
             if points:
                 exposers = points
@@ -545,7 +628,7 @@ class Strategy:
             else:
                 goal = self._nav_target(obs, tracker, phase)
             move = self._move_toward(obs, tracker, goal)
-            if not points:
+            if not points and not classic:
                 if self._stalled_nav(xy, goal, move, t):
                     if self._escape is None:
                         # F3(a): ban this stage/hide for the zone phase and head for the next centre.
@@ -559,10 +642,11 @@ class Strategy:
                         move = self._unit_toward(xy, center)
                 if self._escape is not None and math.hypot(*move) < PARAMS["cover_stall_move"]:
                     move = self._unit_toward(xy, center)  # route search gave up: walk straight in
-            late = self._late(obs, xy, center, radius)
+            late = not classic and self._late(obs, xy, center, radius)
             if late and not (move[0] or move[1]):
                 move = self._unit_toward(xy, center)  # F3(c): late and outside, never stand still
-            if not points and not under_fire and not npc_fire and me["in_zone"] and not late:
+            if (not classic and not points and not under_fire and not npc_fire
+                    and me["in_zone"] and not late):
                 # Quiet approach: below sound.step_speed near the goal, so holding makes no steps.
                 # F2: never while boosting (out of zone or late).
                 if math.dist(xy, goal[:2]) <= PARAMS["quiet_radius_m"]:
@@ -570,21 +654,35 @@ class Strategy:
                     if mag > PARAMS["quiet_move"]:
                         move = (move[0] * PARAMS["quiet_move"] / mag, move[1] * PARAMS["quiet_move"] / mag)
 
+        if (not classic and not points and self._npcs and me["in_zone"]
+                and math.dist(xy, center) <= radius - PARAMS["hold_zone_margin_m"]):
+            step = (xy[0] + move[0] * self.max_step, xy[1] + move[1] * self.max_step)
+            drone = self._route_drone(xy, step)
+            if drone is not None:
+                # A replan or newly sighted drone can invalidate the route after selection.
+                move = (0.0, 0.0)
+                if math.dist(xy, drone) < PARAMS["route_npc_clearance_m"]:
+                    move = self._npc_retreat(xy, drone, center, radius, nearby=True) or move
+                self._prog = None
+
         dx, dy = move
         if dx or dy:
             yaw = math.atan2(dy, dx)
+        elif classic or xy == tuple(center):
+            yaw = me["aim"][0]
         else:
             # Holding at the rim: face the inside of the circle, where the other mechs are.
-            yaw = math.atan2(center[1] - xy[1], center[0] - xy[0]) if xy != tuple(center) else me["aim"][0]
+            yaw = math.atan2(center[1] - xy[1], center[0] - xy[0])
 
+        late = not classic and self._late(obs, xy, center, radius)
         action = {
             "tick": obs["tick"],
             "move": [dx, dy],
             "aim": [yaw, 0.0],
-            "boost": bool(dx or dy) and ((not me["in_zone"]) or self._late(obs, xy, center, radius)),
+            "boost": bool(dx or dy) and ((not me["in_zone"]) or late),
         }
 
-        allow_fire, target_id = self._fire_plan(obs, tracker, phase, under_fire)
+        allow_fire, target_id = self._fire_plan(obs, tracker, phase, under_fire, npc_fire)
         intent = {
             "allow_fire": allow_fire,
             "target_id": target_id,

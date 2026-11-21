@@ -15,6 +15,7 @@ sys.path.insert(0, BOT)
 MAP = os.environ.get("MECH_MAP_DIR") or os.path.join(BOT, "..", "kit", "arena")
 STREAM = os.environ.get("MECH_STREAM") or os.path.join(BOT, "..", "kit", "check", "stream.jsonl.gz")
 
+from params import PARAMS  # noqa: E402
 from strategy import Strategy  # noqa: E402
 
 
@@ -43,7 +44,8 @@ class StrategyV3Test(unittest.TestCase):
         return strat, obs
 
     def plan(self, strat, obs, under_fire=False, phase="hide"):
-        return strat._fire_plan(obs, strat.tracker, phase, under_fire)
+        npc_fire = obs["t"] - strat._npc_t <= PARAMS["under_fire_s"]
+        return strat._fire_plan(obs, strat.tracker, phase, under_fire, npc_fire)
 
     def test_cand10_no_fire_at_visible_mechs_without_a_hit(self):
         strat, obs = self.fresh(mechs=[])
@@ -112,7 +114,7 @@ class StrategyV3Test(unittest.TestCase):
         obs["events"] = [{"type": "damaged", "amount": 30, "weapon": "gun", "bearing": 1.0, "by": 104}]
         strat.act(obs)
         self.assertEqual(strat._hit_t, -math.inf)
-        self.assertEqual(self.plan(strat, obs), (False, None))  # cand-10: no drone fire
+        self.assertEqual(self.plan(strat, obs), (True, 104))  # D2: return fire at the drone
         obs["t"] += 5.0
         self.assertEqual(self.plan(strat, obs), (False, None))
 
@@ -142,7 +144,7 @@ class StrategyV3Test(unittest.TestCase):
             action = strat.act(obs)
             self.assertEqual(strat._phase(obs, strat.tracker), "hide")
             self.assertEqual(strat._hit_t, -math.inf)
-            self.assertFalse(any(action.get("fire", [])))  # cand-10: retreat, no drone fire
+            self.assertEqual(self.plan(strat, obs), (True, 104))  # D2: retreat and return fire
             dx, dy = action["move"]
             self.assertLess(dx, 0.0)
             self.assertAlmostEqual(dy, 0.0)
@@ -344,6 +346,90 @@ class StrategyV3Test(unittest.TestCase):
         self.assertAlmostEqual(math.hypot(*action["move"]), 0.4, places=6)
         walk = self.hello["config"]["mech"]["walk_speed"]
         self.assertLess(0.4 * walk, self.hello["config"]["sound"]["step_speed"])
+
+
+    def test_cand10_park_inside_next_circle_if_hide_route_crosses_drone_range(self):
+        with patch("strategy.World", None):
+            strat, obs = self.fresh(mechs=[], sounds=[], cubes=[], crates=[], drops=[])
+        x, y, _ = obs["self"]["pos"]
+        xy = (x, y)
+        goal = (x + 160.0, y)
+        obs["self"]["in_zone"] = True
+        obs["zone"].update(next_center=list(xy), next_radius=240)
+        strat.tracker.update(obs)
+        strat._npcs[104] = (x + 80.0, y)
+        with patch.object(strat, "_stage_point", return_value=goal):
+            self.assertEqual(strat._nav_target(obs, strat.tracker, "hide"), xy)
+            self.assertEqual(strat._nav_target(obs, strat.tracker, "hide"), xy)
+        self.assertIsNone(strat._route_drone((x + 35.0, y), xy))
+
+    def test_d2_return_fire_pins_the_drone_that_hit_us_and_mech_attacker_comes_first(self):
+        strat, obs = self.fresh(sounds=[], crates=[], cubes=[])
+        x, y, z = obs["self"]["pos"]
+        drone = _mech(104, (x + 30.0, y, z)) | {"kind": "npc"}
+        obs["mechs"] = [drone, _mech(6, (x, y + 30.0, z))]
+        obs["events"] = [{"type": "damaged", "amount": 25, "weapon": "npc", "by": 104, "bearing": 0.0}]
+        with patch.object(strat.combat, "decide", wraps=strat.combat.decide) as decide:
+            strat.act(obs)
+        intent = decide.call_args.args[2]
+        self.assertEqual((intent["allow_fire"], intent["target_id"]), (True, 104))
+        strat._hit_by, strat._hit_t = 6, obs["t"]
+        self.assertEqual(self.plan(strat, obs, under_fire=True), (True, 6))
+        obs["mechs"] = [_mech(6, (x, y + 30.0, z))]  # drone out of sight: no fallthrough
+        self.assertEqual(self.plan(strat, obs), (False, None))
+
+    def test_n1_endgame_and_tiny_circle_keep_cand6_movement(self):
+        strat, obs = self.fresh(mechs=[], sounds=[], cubes=[], crates=[], drops=[], events=[], alive=4)
+        x, y, z = obs["self"]["pos"]
+        center = (x + 3.0, y)
+        obs["self"]["in_zone"] = True
+        obs["zone"].update(next_center=list(center), next_radius=200)
+        strat.tracker.update(obs)
+        self.assertEqual(strat._nav_target(obs, strat.tracker, "endgame"), strat.tracker.safe_center_xy)
+        with patch.object(strat, "_move_toward", return_value=(1.0, 0.0)):
+            action = strat.act(obs)
+        self.assertEqual(action["move"], [1.0, 0.0])  # no quiet clamp, no rim staging
+        self.assertIsNone(strat._stage)
+        with patch.object(strat, "_move_toward", return_value=(0.0, 0.0)):
+            obs["self"]["aim"] = [0.7, 0.0]
+            action = strat.act(obs)
+        self.assertAlmostEqual(action["aim"][0], 0.7)  # cand-6 holds its aim when stationary
+        self.assertFalse(action["boost"])
+
+    def test_n5_stage_and_hide_reject_spots_near_an_untaken_drop(self):
+        strat, obs = self.fresh(mechs=[], sounds=[], cubes=[], crates=[])
+        x, y, z = obs["self"]["pos"]
+        center = (x + 300.0, y)
+        obs["zone"].update(next_center=list(center), next_radius=240, shrink_start=100.0, shrink_end=150.0)
+        strat.tracker.update(obs)
+        plain = strat._stage_point(obs, strat.tracker, (x, y), center, 240)
+        drop = {"id": 20000, "pos": [plain[0], plain[1], z], "radius": 8, "lands_in": 0.0,
+                "capture_s": 4, "progress": 0, "holder": None}
+        obs["drops"] = [drop]
+        obs["t"] += PARAMS["stage_commit_s"]
+        moved = strat._stage_point(obs, strat.tracker, (x, y), center, 240)
+        self.assertGreaterEqual(math.dist(moved, plain), PARAMS["drop_reject_m"])
+        # A hide spot next to the drop falls back to the (clear) stage point.
+        strat._hide, strat._stage = None, None
+        with patch.object(strat, "_stage_point", return_value=moved), \
+                patch.object(strat.tracker.world, "best_hide", return_value=plain), \
+                patch.object(strat, "_reachable_route", return_value=[moved]):
+            self.assertEqual(strat._nav_target(obs, strat.tracker, "hide"), moved)
+
+    def test_f3_reachability_check_is_rate_limited_after_rejections(self):
+        strat, obs = self.fresh(mechs=[], sounds=[], cubes=[], crates=[], drops=[])
+        x, y, z = obs["self"]["pos"]
+        center = (x + 300.0, y)
+        obs["zone"].update(next_center=list(center), next_radius=240, shrink_start=100.0, shrink_end=150.0)
+        strat.tracker.update(obs)
+        match = self.hello["config"]["match"]
+        decision_s = match["decide_every"] / match["tick_hz"]
+        t0 = obs["t"]
+        with patch.object(strat, "_reachable_route", return_value=None) as reach:
+            for step in range(round(PARAMS["reach_interval_s"] / decision_s)):
+                obs["t"] = t0 + step * decision_s
+                strat._nav_target(obs, strat.tracker, "hide")
+        self.assertEqual(reach.call_count, 1)
 
 if __name__ == "__main__":
     unittest.main()

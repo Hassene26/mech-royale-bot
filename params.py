@@ -44,6 +44,7 @@ PARAMS = {
     "stage_drop_w_s": 40.0,
     "stage_npc_avoid_m": 75.0,       # keep away from drones (they shoot mechs within 45 m of home)
     "stage_npc_w_s": 20.0,
+    "route_npc_clearance_m": 50.0,  # 45 m aggro range plus a margin for route following
     "stage_late_w_s": 10.0,          # penalty per second we would arrive after the shrink ends
     "stage_commit_s": 3.0,           # re-pick the rim stage point at most this often
     "stage_hide_radius_m": 28.0,     # cover search radius around the rim stage point
@@ -62,4 +63,6 @@ PARAMS = {
     "stall_goal_m": 2.0,             # F3(a): stall check only while the goal is farther than this
     "stall_window_s": 1.5,
     "stall_progress_m": 1.0,         # stalled if under this progress toward the goal in stall_window_s
+    "reach_interval_s": 3.0,         # F3(b): at most one reachability check per this many seconds
+    "drop_reject_m": 80.0,           # N5: no stage/hide this close to a called, untaken drop if any other remains
 }
