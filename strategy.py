@@ -49,6 +49,11 @@ class Strategy:
         self._npc_bearing = None
         self._cover = None           # (goal_xy, chosen_t) committed hidden spot
         self._cover_retry_t = -math.inf
+        # cand-10 evasion: committed rim stage point and hiding spot, drone homes seen so far.
+        self._stage = None           # (stage_xy, chosen_t, zone_key)
+        self._hide = None            # (hide_xy, chosen_t, stage_xy)
+        self._npcs = {}              # drone id -> last seen xy
+        self.near_range_m = self.cfg["vision"].get("near_range", 45.0)
         # Braking (survival-v3 item 3): full speed beyond one decision's walk, linear inside it.
         match = self.cfg["match"]
         self.max_step = self.cfg["mech"]["walk_speed"] * match["decide_every"] / match["tick_hz"]
@@ -207,40 +212,87 @@ class Strategy:
         return world is not None and world.blocked(*step)
 
     # --- navigation target -------------------------------------------------
+    def _stage_point(self, obs, tracker, xy, center, radius):
+        """cand-10: a point just inside the next circle's edge on our side, rotated along the
+        rim away from tracked mechs/sound ghosts, supply drops and drones, and late arrival."""
+        z = obs["zone"]
+        key = (round(center[0], 1), round(center[1], 1), round(radius, 1))
+        t = obs["t"]
+        if self._stage is not None:
+            stage, chosen, skey = self._stage
+            if skey == key and t - chosen < PARAMS["stage_commit_s"]:
+                return stage
+        margin = min(max(radius * PARAMS["edge_margin_frac"], PARAMS["edge_margin_min_m"]),
+                     PARAMS["edge_margin_max_m"])
+        inner = max(radius - margin, 0.0)
+        dx, dy = xy[0] - center[0], xy[1] - center[1]
+        b0 = math.atan2(dy, dx) if (dx or dy) else 0.0
+        walk = max(self.cfg["mech"]["walk_speed"], 1.0)
+        deadline = z.get("shrink_end", math.inf) - t
+        drops = [d["pos"][:2] for d in obs.get("drops") or () if d.get("pos") is not None]
+        npcs = list(self._npcs.values())
+        best, best_cost = None, math.inf
+        step = PARAMS["stage_arc_step_rad"]
+        for k in range(-PARAMS["stage_arc_steps"], PARAMS["stage_arc_steps"] + 1):
+            b = b0 + k * step
+            p = (center[0] + inner * math.cos(b), center[1] + inner * math.sin(b))
+            travel = math.dist(xy, p) / walk
+            cost = travel + PARAMS["stage_threat_w_s"] * tracker.threat_at(p)
+            cost += PARAMS["stage_late_w_s"] * max(0.0, travel - deadline)
+            for d in drops:
+                dd = math.dist(p, d)
+                if dd < PARAMS["stage_drop_avoid_m"]:
+                    cost += PARAMS["stage_drop_w_s"] * (1.0 - dd / PARAMS["stage_drop_avoid_m"])
+            for n in npcs:
+                dn = math.dist(p, n)
+                if dn < PARAMS["stage_npc_avoid_m"]:
+                    cost += PARAMS["stage_npc_w_s"] * (1.0 - dn / PARAMS["stage_npc_avoid_m"])
+            if cost < best_cost:
+                best, best_cost = p, cost
+        self._stage = (best, t, key)
+        return best
+
     def _nav_target(self, obs, tracker, phase):
-        pos = obs["self"]["pos"]
-        xy = tuple(pos[:2])
+        """cand-10 evasion: no crate detours; a cube only when very close and no mech in sight.
+        Otherwise hide in cover at the near edge of the next circle (centre for small circles)."""
+        xy = tuple(obs["self"]["pos"][:2])
         center, radius = tracker.safe_center_xy, tracker.safe_radius
-        if phase == "endgame":
+        t = obs["t"]
+        if radius <= 0.5:
             return center
-
-        inner = max(0.0, radius - PARAMS["cover_zone_margin_m"])
-        locally_safe = inner > 0 and math.dist(xy, center) <= inner
-        if phase == "loot" and locally_safe:
-            # A removed crate or cube can stay in tracker memory. Only detour for visible loot.
-            candidates = [item["pos"] for item in obs["crates"] + obs["cubes"]]
-            nearby = [p for p in candidates if math.dist(p[:2], xy) <= PARAMS["loot_detour_radius_m"]
-                      and math.dist(p[:2], center) <= inner]
-            if nearby:
-                return min(nearby, key=lambda p: math.dist(xy, p[:2]))
-
-        # Once staged inside the next circle, use nearby cover instead of crossing
-        # open ground to reach a hiding spot near the center.
-        search_center = xy if locally_safe else center
-        search_radius = PARAMS["cover_radius_m"] if locally_safe else PARAMS["hide_search_radius_m"]
-        threats = [tr.pos[:2] for tr in tracker.enemies.values()]
-        if tracker.world is not None:
+        sighted = any(m["kind"] == "mech" for m in obs["mechs"])
+        if not sighted:
+            inner_c = max(radius - PARAMS["hold_zone_margin_m"], 0.0)
+            cubes = [c["pos"] for c in obs["cubes"]
+                     if math.dist(c["pos"][:2], xy) <= PARAMS["cube_grab_m"]
+                     and math.dist(c["pos"][:2], center) <= inner_c]
+            if cubes:
+                return min(cubes, key=lambda p: math.dist(xy, p[:2]))[:2]
+        if radius < PARAMS["edge_small_radius_m"]:
+            stage = center
+            search = max(radius * 0.6, 1.0)
+        else:
+            stage = self._stage_point(obs, tracker, xy, center, radius)
+            search = PARAMS["stage_hide_radius_m"]
+        if self._hide is not None:
+            hide, chosen, hstage = self._hide
+            if hstage == stage and t - chosen < PARAMS["hide_commit_s"]:
+                return hide
+        goal = stage
+        world = tracker.world
+        if world is not None:
+            zone_r = max(radius - PARAMS["cover_zone_margin_m"], radius * 0.5)
+            threats = [tr.pos[:2] for tr in tracker.enemies.values()]
             try:
-                goal = tracker.world.best_hide(
-                    search_center, min(search_radius, radius), threats,
-                    zone_next=(center, inner if locally_safe else radius), me_xy=xy,
-                )
-                return (float(goal[0]), float(goal[1]))
+                g = world.best_hide(stage, min(search, zone_r), threats, zone_next=(center, zone_r),
+                                    budget_ms=PARAMS["cover_budget_ms"], me_xy=xy)
+                goal = (float(g[0]), float(g[1]))
             except Exception as exc:
                 if not self.reported_hide_error:
-                    log("Cover selection failed, using the search center:", exc)
+                    log("Cover selection failed, using the stage point:", exc)
                     self.reported_hide_error = True
-        return search_center
+        self._hide = (goal, t, stage)
+        return goal
 
     def _move_toward(self, obs, tracker, goal):
         """Move vector toward goal, braked so we stop on the goal instead of overshooting it
@@ -267,22 +319,31 @@ class Strategy:
         yaw = math.atan2(gy - y, gx - x)
         return math.cos(yaw), math.sin(yaw)
 
+    def _late(self, obs, xy, center, radius):
+        """True when walking would reach the next circle after its shrink ends (minus slack)."""
+        outside = math.dist(xy, center) - radius
+        if outside <= 0:
+            return False
+        walk = max(self.cfg["mech"]["walk_speed"], 1.0)
+        left = obs["zone"].get("shrink_end", math.inf) - obs["t"]
+        return outside / walk > left - PARAMS["deadline_slack_s"]
+
     # --- fire discipline -------------------------------------------------
     def _fire_plan(self, obs, tracker, phase, under_fire):
-        """Authorize visible-mech fire regardless of the movement state."""
+        """cand-10 evasion: never start a fight. Fire only back at the mech that hit us in the
+        last under_fire_s, and only while it is visible (a specific target_id, so combat cannot
+        fall through to another mech). In the endgame (few left, the circle forces contact) also
+        fire at a mech within near_range or one charging a laser. No drone or crate fire."""
         me = obs["self"]
         xy = me["pos"][:2]
-        if any(m["kind"] == "mech" for m in obs["mechs"]):
-            # Combat chooses among targets with a legal shot for a held weapon.
-            return True, None
-        if obs["t"] - self._npc_t <= PARAMS["under_fire_s"]:
-            for npc in obs["mechs"]:
-                if npc["kind"] == "npc" and npc["id"] == self._npc_by:
-                    return True, npc["id"]
-        if phase == "loot" and not under_fire and not tracker.enemies and me["in_zone"] and obs["crates"]:
-            crate = min(obs["crates"], key=lambda c: math.dist(xy, c["pos"][:2]))
-            if math.dist(xy, crate["pos"][:2]) <= PARAMS["crate_fire_range_m"]:
-                return True, crate["id"]  # farming a near crate with no threat known
+        mechs = [m for m in obs["mechs"] if m["kind"] == "mech"]
+        if under_fire and any(m["id"] == self._hit_by for m in mechs):
+            return True, self._hit_by
+        if phase == "endgame":
+            near = [m for m in mechs
+                    if m.get("charging") or math.dist(xy, m["pos"][:2]) <= self.near_range_m]
+            if near:
+                return True, min(near, key=lambda m: math.dist(xy, m["pos"][:2]))["id"]
         return False, None
 
     def _threat_yaw(self, xy, under_fire, npc_fire):
@@ -322,6 +383,10 @@ class Strategy:
                 self._npc_t = t
                 self._npc_by = by
                 self._npc_bearing = e.get("bearing")
+
+        for m in obs["mechs"]:
+            if m["kind"] == "npc":
+                self._npcs[m["id"]] = tuple(m["pos"][:2])
 
         phase = self._phase(obs, tracker)
         under_fire = t - self._hit_t <= PARAMS["under_fire_s"]
@@ -383,22 +448,32 @@ class Strategy:
             else:
                 goal = self._nav_target(obs, tracker, phase)
             move = self._move_toward(obs, tracker, goal)
+            if not points and not under_fire and not npc_fire:
+                # Quiet approach: below sound.step_speed near the goal, so holding makes no steps.
+                if math.dist(xy, goal[:2]) <= PARAMS["quiet_radius_m"]:
+                    mag = math.hypot(*move)
+                    if mag > PARAMS["quiet_move"]:
+                        move = (move[0] * PARAMS["quiet_move"] / mag, move[1] * PARAMS["quiet_move"] / mag)
 
         dx, dy = move
-        yaw = math.atan2(dy, dx) if (dx or dy) else me["aim"][0]
+        if dx or dy:
+            yaw = math.atan2(dy, dx)
+        else:
+            # Holding at the rim: face the inside of the circle, where the other mechs are.
+            yaw = math.atan2(center[1] - xy[1], center[0] - xy[0]) if xy != tuple(center) else me["aim"][0]
 
         action = {
             "tick": obs["tick"],
             "move": [dx, dy],
             "aim": [yaw, 0.0],
-            "boost": (not me["in_zone"]) and bool(dx or dy),
+            "boost": bool(dx or dy) and ((not me["in_zone"]) or self._late(obs, xy, center, radius)),
         }
 
         allow_fire, target_id = self._fire_plan(obs, tracker, phase, under_fire)
         intent = {
             "allow_fire": allow_fire,
             "target_id": target_id,
-            "loot_priority": PARAMS["loot_priority_default"] and phase == "loot",
+            "loot_priority": False,  # cand-10: no crate farming
         }
 
         combat_aimed = False

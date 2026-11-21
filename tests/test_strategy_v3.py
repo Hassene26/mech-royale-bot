@@ -45,26 +45,29 @@ class StrategyV3Test(unittest.TestCase):
     def plan(self, strat, obs, under_fire=False, phase="hide"):
         return strat._fire_plan(obs, strat.tracker, phase, under_fire)
 
-    def test_authorizes_visible_mechs_even_while_weak_and_outnumbered(self):
+    def test_cand10_no_fire_at_visible_mechs_without_a_hit(self):
         strat, obs = self.fresh(mechs=[])
         me = obs["self"]
         me["hp"] = 10
         x, y, z = me["pos"]
         obs["mechs"] = [_mech(6, (x + 170.0, y, z), charging=True), _mech(7, (x + 150.0, y, z))]
         strat.tracker.update(obs)
-        self.assertEqual(self.plan(strat, obs), (True, None))
+        self.assertEqual(self.plan(strat, obs), (False, None))
 
     def test_fire_at_near_mech(self):
         strat, obs = self.fresh()
         me = obs["self"]["pos"]
         obs["mechs"] = [_mech(7, (me[0] + 30.0, me[1], me[2]))]
-        self.assertEqual(self.plan(strat, obs), (True, None))
+        # cand-10: a near mech that has not hit us is not shot before the endgame.
+        self.assertEqual(self.plan(strat, obs), (False, None))
+        self.assertEqual(self.plan(strat, obs, phase="endgame"), (True, 7))
 
     def test_fire_at_far_charging_mech(self):
         strat, obs = self.fresh()
         me = obs["self"]["pos"]
         obs["mechs"] = [_mech(7, (me[0] + 150.0, me[1], me[2]), charging=True)]
-        self.assertEqual(self.plan(strat, obs), (True, None))
+        self.assertEqual(self.plan(strat, obs), (False, None))
+        self.assertEqual(self.plan(strat, obs, phase="endgame"), (True, 7))
 
     def test_damage_does_not_require_combat_to_target_the_attacker(self):
         strat, obs = self.fresh()
@@ -72,7 +75,8 @@ class StrategyV3Test(unittest.TestCase):
         obs["mechs"] = [_mech(6, (me[0] + 30.0, me[1], me[2])), _mech(7, (me[0] + 150.0, me[1], me[2]))]
         strat._hit_by = 7
         strat._hit_t = obs["t"]
-        self.assertEqual(self.plan(strat, obs, under_fire=True), (True, None))
+        # cand-10: return fire goes to the attacker only, never to the nearer bystander.
+        self.assertEqual(self.plan(strat, obs, under_fire=True), (True, 7))
 
     def test_zone_damage_is_not_a_reason_to_fire(self):
         # Zone damage carries by=None; act() must not set _hit_t for it.
@@ -89,7 +93,7 @@ class StrategyV3Test(unittest.TestCase):
         obs["crates"] = [far]
         self.assertEqual(self.plan(strat, obs, phase="loot"), (False, None))
         obs["crates"] = [near, far]
-        self.assertEqual(self.plan(strat, obs, phase="loot"), (True, 501))
+        self.assertEqual(self.plan(strat, obs, phase="loot"), (False, None))  # cand-10: no crate fire
         self.assertEqual(self.plan(strat, obs, phase="hide"), (False, None))
 
     def test_braking_stops_short_of_goal(self):
@@ -108,7 +112,7 @@ class StrategyV3Test(unittest.TestCase):
         obs["events"] = [{"type": "damaged", "amount": 30, "weapon": "gun", "bearing": 1.0, "by": 104}]
         strat.act(obs)
         self.assertEqual(strat._hit_t, -math.inf)
-        self.assertEqual(self.plan(strat, obs), (True, 104))
+        self.assertEqual(self.plan(strat, obs), (False, None))  # cand-10: no drone fire
         obs["t"] += 5.0
         self.assertEqual(self.plan(strat, obs), (False, None))
 
@@ -138,7 +142,7 @@ class StrategyV3Test(unittest.TestCase):
             action = strat.act(obs)
             self.assertEqual(strat._phase(obs, strat.tracker), "hide")
             self.assertEqual(strat._hit_t, -math.inf)
-            self.assertTrue(action["fire"][0])
+            self.assertFalse(any(action.get("fire", [])))  # cand-10: retreat, no drone fire
             dx, dy = action["move"]
             self.assertLess(dx, 0.0)
             self.assertAlmostEqual(dy, 0.0)
@@ -225,7 +229,8 @@ class StrategyV3Test(unittest.TestCase):
         obs["events"] = [{"type": "damaged", "amount": 45, "weapon": "gun", "bearing": 1.0, "by": 3}]
         strat.act(obs)
         self.assertEqual(strat._hit_by, 3)
-        self.assertEqual(self.plan(strat, obs, under_fire=True), (True, None))
+        # cand-10: the unseen attacker is not the visible mech, so nothing is shot.
+        self.assertEqual(self.plan(strat, obs, under_fire=True), (False, None))
 
     def test_hidden_attacker_without_visible_target_holds_fire(self):
         strat, obs = self.fresh()
@@ -254,7 +259,7 @@ class StrategyV3Test(unittest.TestCase):
         obs["events"] = [{"type": "hit", "target": 1019, "amount": 45, "weapon": "gun"}]
         obs["t"] += 0.1
         strat.tracker.update(obs)
-        self.assertEqual(tuple(strat._nav_target(obs, strat.tracker, "loot")), tuple(cube_pos))
+        self.assertEqual(tuple(strat._nav_target(obs, strat.tracker, "loot")), tuple(cube_pos[:2]))
 
     def test_faces_nearest_mech_before_first_hit_and_through_memory(self):
         strat, obs = self.fresh(mechs=[], events=[], sounds=[], crates=[])
@@ -272,7 +277,7 @@ class StrategyV3Test(unittest.TestCase):
         strat.act(obs)
         self.assertIsNone(strat._threat_yaw((x, y), False, False))
 
-    def test_shoots_first_while_moving_away(self):
+    def test_cand10_never_shoots_first_while_moving_away(self):
         strat, obs = self.fresh(mechs=[], events=[], sounds=[], crates=[])
         strat.tracker.world = None
         me = obs["self"]
@@ -284,7 +289,7 @@ class StrategyV3Test(unittest.TestCase):
         with patch.object(strat, "_move_toward", return_value=(-1, 0)):
             action = strat.act(obs)
         self.assertEqual(action["move"], [-1, 0])
-        self.assertTrue(action["fire"][0])
+        self.assertFalse(any(action.get("fire", [])))  # cand-10: never shoot first
         self.assertEqual(strat._hit_t, -math.inf)
 
     def test_decisions_always_send_explicit_fire_intent(self):
@@ -293,6 +298,52 @@ class StrategyV3Test(unittest.TestCase):
         self.assertIn("fire", action)
         self.assertIn("move", action)
 
+
+    # --- cand-10 evasion ---------------------------------------------------
+    def test_cand10_stage_is_inside_near_edge_on_our_side(self):
+        strat, obs = self.fresh(mechs=[], sounds=[], cubes=[], crates=[], drops=[])
+        x, y, z = obs["self"]["pos"]
+        center = (x + 300.0, y)
+        obs["zone"].update(next_center=list(center), next_radius=240, shrink_start=100.0, shrink_end=150.0)
+        strat.tracker.update(obs)
+        stage = strat._stage_point(obs, strat.tracker, (x, y), center, 240)
+        d = math.dist(stage, center)
+        self.assertLess(d, 240 - 11.0)
+        self.assertGreater(d, 240 - 31.0)
+        self.assertLess(stage[0], center[0])  # our side of the circle
+
+    def test_cand10_stage_rotates_away_from_a_supply_drop(self):
+        strat, obs = self.fresh(mechs=[], sounds=[], cubes=[], crates=[])
+        x, y, z = obs["self"]["pos"]
+        center = (x + 300.0, y)
+        obs["zone"].update(next_center=list(center), next_radius=240, shrink_start=100.0, shrink_end=150.0)
+        strat.tracker.update(obs)
+        plain = strat._stage_point(obs, strat.tracker, (x, y), center, 240)
+        strat._stage = None
+        obs["drops"] = [{"id": 20000, "pos": [plain[0], plain[1], z], "radius": 8, "lands_in": 10.0,
+                         "capture_s": 4, "progress": 0, "holder": None}]
+        moved = strat._stage_point(obs, strat.tracker, (x, y), center, 240)
+        self.assertGreater(math.dist(moved, plain), 40.0)
+
+    def test_cand10_boosts_only_when_late_for_the_next_circle(self):
+        strat, obs = self.fresh()
+        x, y, z = obs["self"]["pos"]
+        center = (x + 300.0, y)
+        obs["zone"].update(next_center=list(center), next_radius=240, shrink_end=obs["t"] + 30.0)
+        self.assertFalse(strat._late(obs, (x, y), center, 240))   # 60 m out, 30 s left
+        obs["zone"].update(shrink_end=obs["t"] + 6.0)
+        self.assertTrue(strat._late(obs, (x, y), center, 240))
+        self.assertFalse(strat._late(obs, (x + 100.0, y), center, 240))  # already inside
+
+    def test_cand10_no_loot_priority_and_quiet_near_goal(self):
+        strat, obs = self.fresh(mechs=[], sounds=[], cubes=[], crates=[], events=[])
+        x, y, z = obs["self"]["pos"]
+        with patch.object(strat, "_nav_target", return_value=(x + 5.0, y)):
+            with patch.object(strat, "_move_toward", return_value=(1.0, 0.0)):
+                action = strat.act(obs)
+        self.assertAlmostEqual(math.hypot(*action["move"]), 0.4, places=6)
+        walk = self.hello["config"]["mech"]["walk_speed"]
+        self.assertLess(0.4 * walk, self.hello["config"]["sound"]["step_speed"])
 
 if __name__ == "__main__":
     unittest.main()

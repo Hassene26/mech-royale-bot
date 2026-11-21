@@ -30,5 +30,26 @@ PARAMS = {
     "cover_stall_move": 0.05,        # minimum move magnitude when pursuing cover under fire
     "cover_min_radius_m": 25.0,      # below this circle size the endgame centre rule applies
     "hold_zone_margin_m": 2.0,       # hold still only this far inside the next circle
-    "crate_fire_range_m": 35.0,      # loot-phase crate shots only this close (same as farm_range)
+    "crate_fire_range_m": 35.0,      # unused by cand-10 (no crate fire); kept for old tests
+
+    # --- cand-10 evasion-only (mech-strategy, COMMS 2026-11-21 ~20:40) ---
+    "edge_margin_frac": 0.12,        # stage this fraction of the next radius inside its edge
+    "edge_margin_min_m": 12.0,
+    "edge_margin_max_m": 30.0,
+    "edge_small_radius_m": 45.0,     # below this next radius, hide near the centre instead of the rim
+    "stage_arc_step_rad": 0.22,      # rim candidates either side of the bearing from the centre to us
+    "stage_arc_steps": 4,
+    "stage_threat_w_s": 25.0,        # seconds of extra travel worth one unit of tracker danger
+    "stage_drop_avoid_m": 110.0,     # keep this far from called, uncaptured supply drops
+    "stage_drop_w_s": 40.0,
+    "stage_npc_avoid_m": 75.0,       # keep away from drones (they shoot mechs within 45 m of home)
+    "stage_npc_w_s": 20.0,
+    "stage_late_w_s": 10.0,          # penalty per second we would arrive after the shrink ends
+    "stage_commit_s": 3.0,           # re-pick the rim stage point at most this often
+    "stage_hide_radius_m": 28.0,     # cover search radius around the rim stage point
+    "hide_commit_s": 3.0,            # keep a chosen hiding spot this long
+    "cube_grab_m": 15.0,             # only walk to a visible cube this close, with no mech in sight
+    "quiet_radius_m": 18.0,          # within this distance of the goal walk slowly (no step sound)
+    "quiet_move": 0.4,               # 0.4 x 11.7 m/s = 4.7 m/s < sound.step_speed 5 m/s
+    "deadline_slack_s": 4.0,         # boost if walking reaches the next circle later than shrink_end - this
 }
