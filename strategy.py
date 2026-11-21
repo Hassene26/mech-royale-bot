@@ -5,7 +5,7 @@ valid Action. Owned by mech-strategy. See docs/INTERFACES.md.
 Survival-v3 (COMMS 2026-11-21 00:33): when a mech threatens us (it shot us, or an enemy mech is in
 sight), we do not walk straight away in the open. We take the nearest spot inside the next circle
 that no known enemy can see (world.visible), commit to it briefly, hold still there (silent), and
-keep shooting back through combat when we have a clear line."""
+use combat to engage visible mechs while moving or holding."""
 import math
 
 from mechfight import log
@@ -44,6 +44,8 @@ class Strategy:
         self._hit_t = -math.inf      # last time a mech (not zone, not unknown) damaged us
         self._hit_bearing = None     # world yaw toward that attacker, when the server gave one
         self._hit_by = None          # id of the mech that last damaged us
+        self._npc_hit_t = -math.inf
+        self._npc_hit_by = None
         self._cover = None           # (goal_xy, chosen_t) committed hidden spot
         # Braking (survival-v3 item 3): full speed beyond one decision's walk, linear inside it.
         match = self.cfg["match"]
@@ -62,10 +64,6 @@ class Strategy:
         if tracker.time_to_shrink < PARAMS["preposition_lead_s"]:
             return "preposition"
         return "hide"
-
-    def _is_weakest(self, obs):
-        me = obs["self"]
-        return me["hp"] / me["max_hp"] < PARAMS["weak_hp_frac"]
 
     # --- threat response (survival-v3) -----------------------------------
     def _mech_threats(self, xy, t):
@@ -216,12 +214,8 @@ class Strategy:
         return math.cos(yaw), math.sin(yaw)
 
     # --- fire discipline -------------------------------------------------
-    def _fire_plan(self, obs, tracker, phase, engage, weakest, under_fire):
-        """(allow_fire, target_id), always sent explicitly (contract, COMMS 23:45/23:50).
-        Return fire at the mech that hurt us. Otherwise fire only at a visible mech that is charging
-        or within quiet_fire_range_m (inside its near sensors, so it would see us anyway), and at a
-        near crate while looting with no threat known. A gun shot carries 320 m, so shooting far
-        unaware targets gives our position away (survival-v3 item 1, mech-strategy 00:45)."""
+    def _fire_plan(self, obs, tracker, phase, under_fire):
+        """Authorize a shot at a visible attacker or the nearest visible mech."""
         me = obs["self"]
         xy = me["pos"][:2]
         mechs = [m for m in obs["mechs"] if m["kind"] == "mech"]
@@ -229,17 +223,13 @@ class Strategy:
             attacker = next((m for m in mechs if m["id"] == self._hit_by), None)
             if attacker is not None:
                 return True, attacker["id"]  # return fire at the visible mech that hurt us
-            # The attacker is out of sight: other mechs still get the quiet gate below (review F1).
         if mechs:
-            pool = [m for m in mechs if m.get("charging")] or mechs
-            target = min(pool, key=lambda m: math.dist(xy, m["pos"][:2]))
-            dist = math.dist(xy, target["pos"][:2])
-            outnumbered = weakest and len(tracker.enemies) >= PARAMS["min_enemy_count_for_caution"]
-            if outnumbered and engage <= PARAMS["flee_score_max"]:
-                return False, None  # outnumbered and weak: stay quiet
-            if target.get("charging") or dist <= PARAMS["quiet_fire_range_m"]:
-                return True, target["id"]
-            return False, None
+            target = min(mechs, key=lambda m: math.dist(me["pos"], m["pos"]))
+            return True, target["id"]
+        if obs["t"] - self._npc_hit_t <= PARAMS["under_fire_s"]:
+            for npc in obs["mechs"]:
+                if npc["kind"] == "npc" and npc["id"] == self._npc_hit_by:
+                    return True, npc["id"]
         if phase == "loot" and not under_fire and not tracker.enemies and me["in_zone"] and obs["crates"]:
             crate = min(obs["crates"], key=lambda c: math.dist(xy, c["pos"][:2]))
             if math.dist(xy, crate["pos"][:2]) <= PARAMS["crate_fire_range_m"]:
@@ -254,12 +244,16 @@ class Strategy:
         xy = tuple(me["pos"][:2])
 
         for e in obs["events"]:
-            # Only a mech attacker counts (NPC ids are outside 0..mechs-1; zone has by=None).
             by = e.get("by")
-            if e.get("type") == "damaged" and isinstance(by, int) and 0 <= by < self.cfg["match"]["mechs"]:
+            if e.get("type") != "damaged" or not isinstance(by, int):
+                continue
+            if 0 <= by < self.cfg["match"]["mechs"]:
                 self._hit_t = t
                 self._hit_bearing = e.get("bearing")
-                self._hit_by = e.get("by")
+                self._hit_by = by
+            elif 100 <= by < 1000:  # protocol NPC IDs; remember separately for return fire only
+                self._npc_hit_t = t
+                self._npc_hit_by = by
 
         phase = self._phase(obs, tracker)
         under_fire = t - self._hit_t <= PARAMS["under_fire_s"]
@@ -312,15 +306,7 @@ class Strategy:
             "boost": (not me["in_zone"]) and bool(dx or dy),
         }
 
-        engage = -1.0
-        if self.combat is not None:
-            try:
-                engage = self.combat.should_engage(obs, tracker)
-            except Exception:
-                engage = -1.0
-        weakest = self._is_weakest(obs)
-
-        allow_fire, target_id = self._fire_plan(obs, tracker, phase, engage, weakest, under_fire)
+        allow_fire, target_id = self._fire_plan(obs, tracker, phase, under_fire)
         intent = {
             "allow_fire": allow_fire,
             "target_id": target_id,

@@ -42,17 +42,18 @@ class StrategyV3Test(unittest.TestCase):
         return strat, obs
 
     def plan(self, strat, obs, under_fire=False, phase="hide"):
-        return strat._fire_plan(obs, strat.tracker, phase, -1.0, False, under_fire)
+        return strat._fire_plan(obs, strat.tracker, phase, under_fire)
 
-    def test_no_fire_at_unaware_far_mech(self):
+    def test_nearest_visible_mech_even_while_weak_and_outnumbered(self):
         strat, obs = self.fresh(mechs=[])
-        me = obs["self"]["pos"]
-        obs["mechs"] = [_mech(7, (me[0] + 150.0, me[1], me[2]))]
-        allow, target = self.plan(strat, obs)
-        self.assertFalse(allow)
-        self.assertIsNone(target)
+        me = obs["self"]
+        me["hp"] = 10
+        x, y, z = me["pos"]
+        obs["mechs"] = [_mech(6, (x + 170.0, y, z), charging=True), _mech(7, (x + 150.0, y, z))]
+        strat.tracker.update(obs)
+        self.assertEqual(self.plan(strat, obs), (True, 7))
 
-    def test_fire_at_near_mech_inside_quiet_range(self):
+    def test_fire_at_near_mech(self):
         strat, obs = self.fresh()
         me = obs["self"]["pos"]
         obs["mechs"] = [_mech(7, (me[0] + 30.0, me[1], me[2]))]
@@ -64,10 +65,10 @@ class StrategyV3Test(unittest.TestCase):
         obs["mechs"] = [_mech(7, (me[0] + 150.0, me[1], me[2]), charging=True)]
         self.assertEqual(self.plan(strat, obs), (True, 7))
 
-    def test_return_fire_at_attacker_out_of_quiet_range(self):
+    def test_return_fire_prefers_visible_attacker(self):
         strat, obs = self.fresh()
         me = obs["self"]["pos"]
-        obs["mechs"] = [_mech(7, (me[0] + 150.0, me[1], me[2]))]
+        obs["mechs"] = [_mech(6, (me[0] + 30.0, me[1], me[2])), _mech(7, (me[0] + 150.0, me[1], me[2]))]
         strat._hit_by = 7
         strat._hit_t = obs["t"]
         self.assertEqual(self.plan(strat, obs, under_fire=True), (True, 7))
@@ -99,35 +100,32 @@ class StrategyV3Test(unittest.TestCase):
         dx, dy = strat._move_toward(obs, strat.tracker, (x + 50.0, y))
         self.assertAlmostEqual(math.hypot(dx, dy), 1.0, places=6)
 
-    def test_npc_hit_does_not_open_fire_at_unaware_far_mech(self):
-        # review F1 case A: NPC (id 104) hits us; unaware mech 7 at 150 m must not be shot.
+    def test_visible_npc_retaliation_expires_and_preserves_mech_threat_state(self):
         strat, obs = self.fresh()
         me = obs["self"]["pos"]
-        obs["mechs"] = [_mech(7, (me[0] + 150.0, me[1], me[2]))]
+        obs["mechs"] = [_mech(104, (me[0] + 20.0, me[1], me[2])) | {"kind": "npc"}]
         obs["events"] = [{"type": "damaged", "amount": 30, "weapon": "gun", "bearing": 1.0, "by": 104}]
-        action = strat.act(obs)
+        strat.act(obs)
         self.assertEqual(strat._hit_t, -math.inf)
-        self.assertEqual(action["fire"], [False, False])
+        self.assertEqual(self.plan(strat, obs), (True, 104))
+        obs["t"] += 5.0
+        self.assertEqual(self.plan(strat, obs), (False, None))
 
-    def test_hidden_attacker_does_not_open_fire_at_unaware_far_mech(self):
-        # review F1 case B: mech 3 hits us from out of sight; unaware mech 7 at 150 m must not be shot.
+    def test_hidden_attacker_falls_back_to_visible_mech(self):
         strat, obs = self.fresh()
         me = obs["self"]["pos"]
         obs["mechs"] = [_mech(7, (me[0] + 150.0, me[1], me[2]))]
         obs["events"] = [{"type": "damaged", "amount": 45, "weapon": "gun", "bearing": 1.0, "by": 3}]
-        action = strat.act(obs)
+        strat.act(obs)
         self.assertEqual(strat._hit_by, 3)
-        self.assertEqual(action["fire"], [False, False])
-        self.assertEqual(self.plan(strat, obs, under_fire=True), (False, None))
+        self.assertEqual(self.plan(strat, obs, under_fire=True), (True, 7))
 
-    def test_hidden_attacker_still_allows_near_mech(self):
-        # Attacker out of sight, but a visible mech is inside quiet range: the quiet gate applies to it.
+    def test_hidden_attacker_without_visible_target_holds_fire(self):
         strat, obs = self.fresh()
-        me = obs["self"]["pos"]
-        obs["mechs"] = [_mech(7, (me[0] + 30.0, me[1], me[2]))]
+        obs["mechs"] = []
         strat._hit_by = 3
         strat._hit_t = obs["t"]
-        self.assertEqual(self.plan(strat, obs, under_fire=True), (True, 7))
+        self.assertEqual(self.plan(strat, obs, under_fire=True), (False, None))
 
     def test_hidden_attacker_stops_crate_farming(self):
         strat, obs = self.fresh(mechs=[], sounds=[])
