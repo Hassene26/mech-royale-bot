@@ -52,7 +52,17 @@ class Bot:
     def act(self, obs: mf.Observation) -> mf.Action:
         if self.strategy is None:
             return _fallback_action(obs)
+        # Outer guard: the alarm is only armed inside _guarded_act, but it can still fire in its
+        # finally clause or in the logging below. Catching _Timeout here keeps the process alive.
+        try:
+            return self._guarded_act(obs)
+        except _Timeout:
+            mf.log(f"tick {obs.get('tick')}: strategy.act exceeded {ALARM_BUDGET_S * 1000:.0f}ms, using fallback")
+        except Exception:
+            mf.log(f"tick {obs.get('tick')}: act failed:\n" + traceback.format_exc())
+        return _fallback_action(obs)
 
+    def _guarded_act(self, obs: mf.Observation) -> mf.Action:
         old_handler = None
         if _HAS_ALARM:
             old_handler = signal.signal(signal.SIGALRM, _on_alarm)
@@ -61,15 +71,13 @@ class Bot:
             action = self.strategy.act(obs)
             if isinstance(action, dict) and "tick" in action:
                 return action
-            mf.log(f"tick {obs['tick']}: strategy.act returned {action!r}, using fallback")
-        except _Timeout:
-            mf.log(f"tick {obs['tick']}: strategy.act exceeded {ALARM_BUDGET_S * 1000:.0f}ms, using fallback")
-        except Exception:
-            mf.log(f"tick {obs['tick']}: strategy.act failed:\n" + traceback.format_exc())
+            mf.log(f"tick {obs.get('tick')}: strategy.act returned {action!r}, using fallback")
         finally:
             if _HAS_ALARM:
-                signal.setitimer(signal.ITIMER_REAL, 0)
-                signal.signal(signal.SIGALRM, old_handler)
+                try:
+                    signal.setitimer(signal.ITIMER_REAL, 0)
+                finally:
+                    signal.signal(signal.SIGALRM, old_handler)
         return _fallback_action(obs)
 
 
