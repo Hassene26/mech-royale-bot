@@ -66,22 +66,13 @@ class StrategyV3Test(unittest.TestCase):
         obs["mechs"] = [_mech(7, (me[0] + 150.0, me[1], me[2]), charging=True)]
         self.assertEqual(self.plan(strat, obs), (True, None))
 
-    def test_combat_prefers_recent_visible_attacker_then_resumes_hp_ranking(self):
-        strat, obs = self.fresh(events=[], pickups=[], crates=[])
-        x, y, z = obs["self"]["pos"]
-        front = _mech(6, (x + 60, y, z))
-        front["hp"] = 300
-        obs["mechs"] = [front, _mech(7, (x - 35, y, z))]
-        obs["events"] = [{"type": "damaged", "by": 7, "bearing": math.pi, "rear": True}]
-        # Strategy authorizes either mech so combat can fall back if the attacker has no shot.
+    def test_damage_does_not_require_combat_to_target_the_attacker(self):
+        strat, obs = self.fresh()
+        me = obs["self"]["pos"]
+        obs["mechs"] = [_mech(6, (me[0] + 30.0, me[1], me[2])), _mech(7, (me[0] + 150.0, me[1], me[2]))]
+        strat._hit_by = 7
+        strat._hit_t = obs["t"]
         self.assertEqual(self.plan(strat, obs, under_fire=True), (True, None))
-        intent = {"allow_fire": True}
-        for elapsed, expected_yaw in [(0, math.pi), (0.3, math.pi), (1.1, 0)]:
-            obs["t"] = self.obs[0]["t"] + elapsed
-            if elapsed:
-                obs["events"] = []
-            aim = strat.combat.decide(obs, None, intent).aim
-            self.assertAlmostEqual(abs(aim[0]), expected_yaw)
 
     def test_zone_damage_is_not_a_reason_to_fire(self):
         # Zone damage carries by=None; act() must not set _hit_t for it.
@@ -89,6 +80,26 @@ class StrategyV3Test(unittest.TestCase):
         obs["events"] = [{"type": "damaged", "amount": 20, "weapon": "zone", "bearing": None, "by": None}]
         strat.act(obs)
         self.assertEqual(strat._hit_t, -math.inf)
+
+    def test_endgame_hold_strafes_under_fire_inside_both_circles(self):
+        strat, obs = self.fresh(alive=2, t=240.0, mechs=[], events=[], sounds=[])
+        strat.tracker.world = None
+        x, y, z = obs["self"]["pos"]
+        obs["self"]["in_zone"] = True
+        obs["zone"].update(center=[x, y - 2.0], radius=8.0,
+                           next_center=[x, y], next_radius=6.0)
+        self.assertEqual(strat.act(obs)["move"], [0.0, 0.0])
+        obs["self"]["pos"] = [x, y + 3.5, z]
+        obs["events"] = [{"type": "damaged", "amount": 45, "weapon": "gun", "bearing": 0.0, "by": 3}]
+        action = strat.act(obs)
+        dx, dy = action["move"]
+        self.assertAlmostEqual(dx, 0.0)
+        self.assertLess(dy, 0.0)  # the preferred side would cross the braking margin
+        self.assertEqual(action["aim"][0], 0.0)
+
+        obs["self"]["pos"] = [x, y, z]
+        obs.update(t=obs["t"] + 4.1, events=[])
+        self.assertEqual(strat.act(obs)["move"], [0.0, 0.0])
 
     def test_crate_fire_only_near_while_looting(self):
         strat, obs = self.fresh()

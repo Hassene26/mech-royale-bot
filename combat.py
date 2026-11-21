@@ -21,8 +21,6 @@ class Combat:
         self.cfg = hello["config"]
         self.tick = 1 / self.cfg["match"]["tick_hz"]
         self.step = self.tick * self.cfg["match"]["decide_every"]
-        self.attacker_id = None
-        self.attacker_until = -math.inf
         self.laser_point = None
         priority = ("mech.hp", "mech.regen_per_s", "mech.regen_delay", "mech.armor", "mech.walk_speed",
                     "mech.energy_regen", "mech.energy", "mech.boost_drain")
@@ -33,19 +31,19 @@ class Combat:
             for u in self.cfg["upgrades"]
         }
 
-    def _score(self, me, enemy, count, rear, attacker_id=None):
+    def _score(self, me, enemy, count, rear):
         own = {w["kind"] for w in me["weapons"] if w}
         theirs = enemy.get("weapons", ())
         good = any(COUNTERS.get(w) in theirs for w in own)
         bad = any(COUNTERS.get(w) in own for w in theirs)
         hp = self.cfg["mech"]["hp"]
-        return ((enemy["id"] == attacker_id) + (me["hp"] - enemy.get("hp", hp)) / hp + (good - bad) / 3
+        return ((me["hp"] - enemy.get("hp", hp)) / hp + (good - bad) / 3
                 - count / 4 - rear / 2 - int(not me["in_zone"]))
 
-    def _enemies(self, obs, attacker_id=None):
+    def _enemies(self, obs):
         enemies = [m for m in obs["mechs"] if m["kind"] == "mech"]
         rear = any(e.get("rear") and e["type"] == "damaged" for e in obs["events"])
-        return [(self._score(obs["self"], m, len(enemies), rear, attacker_id), m) for m in enemies]
+        return [(self._score(obs["self"], m, len(enemies), rear), m) for m in enemies]
 
     def should_engage(self, obs, tracker):
         return max((s for s, _ in self._enemies(obs)), default=-1.0)
@@ -216,14 +214,7 @@ class Combat:
     def decide(self, obs, tracker, intent):
         """Select the best-scoring visible enemy even below zero. Strategy gates fire via allow_fire."""
         me = obs["self"]
-        for event in obs["events"]:
-            source = event.get("by")
-            if event["type"] == "damaged" and isinstance(source, int) and 0 <= source < self.cfg["match"]["mechs"]:
-                self.attacker_id = source
-                # Hold the preference across the torso turn and between incoming shots.
-                self.attacker_until = obs["t"] + 1.0
-        attacker_id = self.attacker_id if obs["t"] <= self.attacker_until else None
-        enemies = self._enemies(obs, attacker_id)
+        enemies = self._enemies(obs)
         score, target = max(enemies, key=lambda pair: pair[0], default=(-1.0, None))
         out = CombatOut(engage_score=score)
         self._loot(obs, enemies, out)

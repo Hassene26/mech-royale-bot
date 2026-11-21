@@ -51,7 +51,9 @@ class Strategy:
         self._cover_retry_t = -math.inf
         # Braking (survival-v3 item 3): full speed beyond one decision's walk, linear inside it.
         match = self.cfg["match"]
-        self.max_step = self.cfg["mech"]["walk_speed"] * match["decide_every"] / match["tick_hz"]
+        decision_s = match["decide_every"] / match["tick_hz"]
+        self.max_step = self.cfg["mech"]["walk_speed"] * decision_s
+        self._npc_hit_confirm_s = self.cfg["npc"]["cooldown"] + 2 * decision_s
 
     def _avoid(self, x, y):
         """World avoid(x, y) -> float. threat_at takes one xy; do not pass the method itself."""
@@ -82,7 +84,7 @@ class Strategy:
             out.append(tr)
         return out
 
-    def _exposed_to(self, obs, points):
+    def _exposed_to(self, obs, points, npc=None):
         """True if any threat point can see our body (server vision rule, worst case yaw).
         Without a map we cannot tell cover from open ground, so any threat counts as exposure."""
         world = self.tracker.world
@@ -90,7 +92,10 @@ class Strategy:
             return bool(points)
         me = obs["self"]["pos"]
         try:
-            return any(world.visible(p, None, me) for p in points)
+            return any(
+                world.visible(p, None, me, eye_h=self.cfg["npc"]["height"]) if p is npc
+                else world.visible(p, None, me) for p in points
+            )
         except Exception:
             return True
 
@@ -172,6 +177,27 @@ class Strategy:
                 return goal
             side = -side
         return center
+
+    def _endgame_strafe(self, obs, xy, center, radius, bearing):
+        """Take a clear step across incoming fire while staged inside both circles."""
+        if bearing is None or not obs["self"]["in_zone"]:
+            return None
+        zone = obs["zone"]
+        inner = radius - PARAMS["hold_zone_margin_m"]
+        if math.dist(xy, center) > inner:
+            return None
+
+        world = self.tracker.world
+        side = 1 if int(obs["t"] / PARAMS["strafe_period_s"]) % 2 == 0 else -1
+        for offset in (side * math.pi / 2, -side * math.pi / 2,
+                       side * 3 * math.pi / 4, -side * 3 * math.pi / 4):
+            dx, dy = math.cos(bearing + offset), math.sin(bearing + offset)
+            step = xy[0] + dx * self.max_step, xy[1] + dy * self.max_step
+            if math.dist(step, center) > inner or math.dist(step, zone["center"]) > zone["radius"]:
+                continue
+            if world is None or world.walk_clear(xy, step):
+                return dx, dy
+        return None
 
     def _npc_retreat(self, xy, npc, center, radius, nearby=False):
         """Walk directly away when clear, or use a walkable side step around an obstacle."""
@@ -333,6 +359,9 @@ class Strategy:
         following_cover = False
 
         center, radius = tracker.safe_center_xy, tracker.safe_radius
+        if phase == "endgame" and (under_fire or npc_fire):
+            bearing = self._hit_bearing if under_fire else self._npc_bearing
+            move = self._endgame_strafe(obs, xy, center, radius, bearing)
         if phase != "endgame" and me["in_zone"] and radius >= PARAMS["cover_min_radius_m"]:
             threats = self._mech_threats(xy, t)
             seen_now = any(tr.last_seen_t == t for tr in threats)
@@ -348,8 +377,9 @@ class Strategy:
                 if npc is not None:
                     points.append(npc)
                 drone_only = npc is not None and not (threats or under_fire)
-                # A fresh drone hit overrides the map's estimate of whether we are hidden.
-                hidden = bool(points) and t != self._npc_t and not self._exposed_to(obs, points)
+                # Damage remains evidence of exposure through the drone's next shot.
+                recent_drone_hit = t - self._npc_t <= self._npc_hit_confirm_s
+                hidden = bool(points) and not recent_drone_hit and not self._exposed_to(obs, points, npc)
                 if hidden and math.dist(xy, center) <= radius - PARAMS["hold_zone_margin_m"]:
                     move = (0.0, 0.0)
                 elif drone_only:
