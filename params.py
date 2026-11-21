@@ -52,4 +52,14 @@ PARAMS = {
     "quiet_radius_m": 18.0,          # within this distance of the goal walk slowly (no step sound)
     "quiet_move": 0.4,               # 0.4 x 11.7 m/s = 4.7 m/s < sound.step_speed 5 m/s
     "deadline_slack_s": 4.0,         # boost if walking reaches the next circle later than shrink_end - this
+    # --- cand-10 fixes (mech-review 20:58/21:04, mech-lead 21:06) ---
+    "stage_switch_s": 5.0,           # F1: re-pick the stage only if the new one is this much cheaper
+    "stage_ban_radius_m": 20.0,      # F3: banned stage/hide spots exclude candidates this close
+    "reach_budget_ms": 20.0,         # F3(b): route check budget when picking a hide (rate-limited)
+    "reach_end_tol_m": 4.0,          # route must end within one nav cell of the hide spot
+    "reach_detour_mult": 1.5,        # reject routes longer than 1.5 x straight + 20 m
+    "reach_detour_add_m": 20.0,
+    "stall_goal_m": 2.0,             # F3(a): stall check only while the goal is farther than this
+    "stall_window_s": 1.5,
+    "stall_progress_m": 1.0,         # stalled if under this progress toward the goal in stall_window_s
 }

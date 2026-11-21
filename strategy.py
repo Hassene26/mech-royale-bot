@@ -51,7 +51,10 @@ class Strategy:
         self._cover_retry_t = -math.inf
         # cand-10 evasion: committed rim stage point and hiding spot, drone homes seen so far.
         self._stage = None           # (stage_xy, chosen_t, zone_key)
-        self._hide = None            # (hide_xy, chosen_t, stage_xy)
+        self._hide = None            # (hide_xy, chosen_t, stage_xy, zone_key)
+        self._banned_key, self._banned = None, []   # F3: stalled/unreachable spots per zone phase
+        self._escape = None          # zone key while heading for the next centre after a ban
+        self._prog = None            # (goal_xy, t0, dist0) progress check for normal navigation
         self._npcs = {}              # drone id -> last seen xy
         self.near_range_m = self.cfg["vision"].get("near_range", 45.0)
         # Braking (survival-v3 item 3): full speed beyond one decision's walk, linear inside it.
@@ -212,54 +215,115 @@ class Strategy:
         return world is not None and world.blocked(*step)
 
     # --- navigation target -------------------------------------------------
+    def _zone_key(self, center, radius):
+        return (round(center[0], 1), round(center[1], 1), round(radius, 1))
+
+    def _ban(self, key, *points):
+        """F3: a stage/hide that stalled or is unreachable stays banned for this zone phase."""
+        if self._banned_key != key:
+            self._banned_key, self._banned = key, []
+        self._banned.extend(tuple(p[:2]) for p in points if p is not None)
+        self._stage = None
+        self._hide = None
+        self._prog = None
+
+    def _is_banned(self, key, p):
+        return self._banned_key == key and any(
+            math.dist(p, b) <= PARAMS["stage_ban_radius_m"] for b in self._banned)
+
+    def _stage_cost(self, obs, tracker, xy, p):
+        walk = max(self.cfg["mech"]["walk_speed"], 1.0)
+        deadline = obs["zone"].get("shrink_end", math.inf) - obs["t"]
+        travel = math.dist(xy, p) / walk
+        cost = travel + PARAMS["stage_threat_w_s"] * tracker.threat_at(p)
+        cost += PARAMS["stage_late_w_s"] * max(0.0, travel - deadline)
+        for d in obs.get("drops") or ():
+            if d.get("pos") is None:
+                continue
+            dd = math.dist(p, d["pos"][:2])
+            if dd < PARAMS["stage_drop_avoid_m"]:
+                cost += PARAMS["stage_drop_w_s"] * (1.0 - dd / PARAMS["stage_drop_avoid_m"])
+        for n in self._npcs.values():
+            dn = math.dist(p, n)
+            if dn < PARAMS["stage_npc_avoid_m"]:
+                cost += PARAMS["stage_npc_w_s"] * (1.0 - dn / PARAMS["stage_npc_avoid_m"])
+        return cost
+
     def _stage_point(self, obs, tracker, xy, center, radius):
         """cand-10: a point just inside the next circle's edge on our side, rotated along the
-        rim away from tracked mechs/sound ghosts, supply drops and drones, and late arrival."""
-        z = obs["zone"]
-        key = (round(center[0], 1), round(center[1], 1), round(radius, 1))
+        rim away from tracked mechs/sound ghosts, supply drops and drones, and late arrival.
+        F1: the committed stage is kept unless the zone changes, it is banned, or a new pick is
+        at least stage_switch_s cheaper (the old stage is re-scored, not dropped on a timer).
+        Returns None when every candidate is banned."""
+        key = self._zone_key(center, radius)
         t = obs["t"]
+        old = None
         if self._stage is not None:
             stage, chosen, skey = self._stage
-            if skey == key and t - chosen < PARAMS["stage_commit_s"]:
-                return stage
+            if skey == key and not self._is_banned(key, stage):
+                if t - chosen < PARAMS["stage_commit_s"]:
+                    return stage
+                old = stage
         margin = min(max(radius * PARAMS["edge_margin_frac"], PARAMS["edge_margin_min_m"]),
                      PARAMS["edge_margin_max_m"])
         inner = max(radius - margin, 0.0)
         dx, dy = xy[0] - center[0], xy[1] - center[1]
         b0 = math.atan2(dy, dx) if (dx or dy) else 0.0
-        walk = max(self.cfg["mech"]["walk_speed"], 1.0)
-        deadline = z.get("shrink_end", math.inf) - t
-        drops = [d["pos"][:2] for d in obs.get("drops") or () if d.get("pos") is not None]
-        npcs = list(self._npcs.values())
         best, best_cost = None, math.inf
         step = PARAMS["stage_arc_step_rad"]
         for k in range(-PARAMS["stage_arc_steps"], PARAMS["stage_arc_steps"] + 1):
             b = b0 + k * step
             p = (center[0] + inner * math.cos(b), center[1] + inner * math.sin(b))
-            travel = math.dist(xy, p) / walk
-            cost = travel + PARAMS["stage_threat_w_s"] * tracker.threat_at(p)
-            cost += PARAMS["stage_late_w_s"] * max(0.0, travel - deadline)
-            for d in drops:
-                dd = math.dist(p, d)
-                if dd < PARAMS["stage_drop_avoid_m"]:
-                    cost += PARAMS["stage_drop_w_s"] * (1.0 - dd / PARAMS["stage_drop_avoid_m"])
-            for n in npcs:
-                dn = math.dist(p, n)
-                if dn < PARAMS["stage_npc_avoid_m"]:
-                    cost += PARAMS["stage_npc_w_s"] * (1.0 - dn / PARAMS["stage_npc_avoid_m"])
+            if self._is_banned(key, p):
+                continue
+            cost = self._stage_cost(obs, tracker, xy, p)
             if cost < best_cost:
                 best, best_cost = p, cost
+        if old is not None and (best is None or
+                                best_cost + PARAMS["stage_switch_s"] > self._stage_cost(obs, tracker, xy, old)):
+            best = old
+        if best is None:
+            self._stage = None
+            return None
         self._stage = (best, t, key)
         return best
 
+    def _reachable(self, xy, goal):
+        """F3(b): a full route no longer than 1.5 x the straight line + 20 m (20 ms budget)."""
+        world = self.tracker.world
+        if world is None:
+            return True
+        try:
+            route = world.path(xy, goal, budget_ms=PARAMS["reach_budget_ms"])
+        except Exception:
+            return True
+        if not route or math.dist(route[-1], goal[:2]) > PARAMS["reach_end_tol_m"]:
+            return False
+        length, prev = 0.0, xy
+        for pt in route:
+            length += math.dist(prev, pt[:2])
+            prev = pt[:2]
+        straight = math.dist(xy, goal[:2])
+        return length <= PARAMS["reach_detour_mult"] * straight + PARAMS["reach_detour_add_m"]
+
     def _nav_target(self, obs, tracker, phase):
         """cand-10 evasion: no crate detours; a cube only when very close and no mech in sight.
-        Otherwise hide in cover at the near edge of the next circle (centre for small circles)."""
+        Otherwise hide in cover at the near edge of the next circle (centre for small circles).
+        F1: the hide spot is kept until reached or invalid (zone change, stage change, outside
+        the circle, or a mech in sight once the commit time has passed); F3: an unreachable or
+        stalled hide is banned and we head for the next centre (escape) until well inside."""
         xy = tuple(obs["self"]["pos"][:2])
         center, radius = tracker.safe_center_xy, tracker.safe_radius
         t = obs["t"]
+        key = self._zone_key(center, radius)
         if radius <= 0.5:
             return center
+        margin = min(max(radius * PARAMS["edge_margin_frac"], PARAMS["edge_margin_min_m"]),
+                     PARAMS["edge_margin_max_m"])
+        if self._escape is not None:
+            if self._escape == key and math.dist(xy, center) > max(radius - margin, 0.0):
+                return center
+            self._escape = None
         sighted = any(m["kind"] == "mech" for m in obs["mechs"])
         if not sighted:
             inner_c = max(radius - PARAMS["hold_zone_margin_m"], 0.0)
@@ -274,14 +338,19 @@ class Strategy:
         else:
             stage = self._stage_point(obs, tracker, xy, center, radius)
             search = PARAMS["stage_hide_radius_m"]
+            if stage is None:
+                self._escape = key
+                return center
+        zone_r = max(radius - PARAMS["cover_zone_margin_m"], radius * 0.5)
         if self._hide is not None:
-            hide, chosen, hstage = self._hide
-            if hstage == stage and t - chosen < PARAMS["hide_commit_s"]:
+            hide, chosen, hstage, hkey = self._hide
+            valid = (hkey == key and hstage == stage and math.dist(hide, center) <= zone_r
+                     and not (sighted and t - chosen >= PARAMS["hide_commit_s"]))
+            if valid:
                 return hide
         goal = stage
         world = tracker.world
         if world is not None:
-            zone_r = max(radius - PARAMS["cover_zone_margin_m"], radius * 0.5)
             threats = [tr.pos[:2] for tr in tracker.enemies.values()]
             try:
                 g = world.best_hide(stage, min(search, zone_r), threats, zone_next=(center, zone_r),
@@ -291,8 +360,30 @@ class Strategy:
                 if not self.reported_hide_error:
                     log("Cover selection failed, using the stage point:", exc)
                     self.reported_hide_error = True
-        self._hide = (goal, t, stage)
+        if not self._reachable(xy, goal):
+            self._ban(key, goal, stage if stage != center else None)
+            self._escape = key if stage == center else None
+            return center
+        self._hide = (goal, t, stage, key)
         return goal
+
+    def _stalled_nav(self, xy, goal, move, t):
+        """F3(a): no move while the goal is > 2 m away, or < 1 m progress in 1.5 s."""
+        d = math.dist(xy, goal[:2])
+        if d <= PARAMS["stall_goal_m"]:
+            self._prog = None
+            return False
+        if math.hypot(*move) < PARAMS["cover_stall_move"]:
+            return True
+        prog = self._prog
+        if prog is None or prog[0] != tuple(goal[:2]):
+            self._prog = (tuple(goal[:2]), t, d)
+            return False
+        if t - prog[1] >= PARAMS["stall_window_s"]:
+            if prog[2] - d < PARAMS["stall_progress_m"]:
+                return True
+            self._prog = (tuple(goal[:2]), t, d)
+        return False
 
     def _move_toward(self, obs, tracker, goal):
         """Move vector toward goal, braked so we stop on the goal instead of overshooting it
@@ -318,6 +409,12 @@ class Strategy:
                     self.reported_route_error = True
         yaw = math.atan2(gy - y, gx - x)
         return math.cos(yaw), math.sin(yaw)
+
+    @staticmethod
+    def _unit_toward(xy, goal):
+        dx, dy = goal[0] - xy[0], goal[1] - xy[1]
+        d = math.hypot(dx, dy)
+        return (dx / d, dy / d) if d > 1e-6 else (0.0, 0.0)
 
     def _late(self, obs, xy, center, radius):
         """True when walking would reach the next circle after its shrink ends (minus slack)."""
@@ -448,8 +545,26 @@ class Strategy:
             else:
                 goal = self._nav_target(obs, tracker, phase)
             move = self._move_toward(obs, tracker, goal)
-            if not points and not under_fire and not npc_fire:
+            if not points:
+                if self._stalled_nav(xy, goal, move, t):
+                    if self._escape is None:
+                        # F3(a): ban this stage/hide for the zone phase and head for the next centre.
+                        key = self._zone_key(center, radius)
+                        self._ban(key, goal, self._stage[0] if self._stage else None)
+                        self._escape = key
+                        goal = center
+                        move = self._move_toward(obs, tracker, goal)
+                    else:
+                        self._prog = None
+                        move = self._unit_toward(xy, center)
+                if self._escape is not None and math.hypot(*move) < PARAMS["cover_stall_move"]:
+                    move = self._unit_toward(xy, center)  # route search gave up: walk straight in
+            late = self._late(obs, xy, center, radius)
+            if late and not (move[0] or move[1]):
+                move = self._unit_toward(xy, center)  # F3(c): late and outside, never stand still
+            if not points and not under_fire and not npc_fire and me["in_zone"] and not late:
                 # Quiet approach: below sound.step_speed near the goal, so holding makes no steps.
+                # F2: never while boosting (out of zone or late).
                 if math.dist(xy, goal[:2]) <= PARAMS["quiet_radius_m"]:
                     mag = math.hypot(*move)
                     if mag > PARAMS["quiet_move"]:
