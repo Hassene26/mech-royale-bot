@@ -200,7 +200,9 @@ class Combat:
         if target is None and requested is None and farm and intent.get("loot_priority"):
             target = min(obs["crates"] + obs["mechs"], key=lambda m: math.dist(m["pos"], me["pos"]), default=None)
         if target and target.get("kind") != "mech" and not farm:
-            target = None
+            if not (target.get("kind") == "npc" and requested == target["id"]
+                    and intent.get("allow_fire") is True):
+                target = None
         # Reconstruct the last lock from its world point as our mech moves.
         laser = next((i for i, w in enumerate(me["weapons"])
                       if w and w["kind"] == "laser" and w.get("charge")), None)
