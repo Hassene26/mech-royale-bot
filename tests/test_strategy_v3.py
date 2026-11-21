@@ -99,6 +99,36 @@ class StrategyV3Test(unittest.TestCase):
         dx, dy = strat._move_toward(obs, strat.tracker, (x + 50.0, y))
         self.assertAlmostEqual(math.hypot(dx, dy), 1.0, places=6)
 
+    def test_npc_hit_does_not_open_fire_at_unaware_far_mech(self):
+        # review F1 case A: NPC (id 104) hits us; unaware mech 7 at 150 m must not be shot.
+        strat, obs = self.fresh()
+        me = obs["self"]["pos"]
+        obs["mechs"] = [_mech(7, (me[0] + 150.0, me[1], me[2]))]
+        obs["events"] = [{"type": "damaged", "amount": 30, "weapon": "gun", "bearing": 1.0, "by": 104}]
+        action = strat.act(obs)
+        self.assertEqual(strat._hit_t, -math.inf)
+        self.assertEqual(action["fire"], [False, False])
+
+    def test_hidden_attacker_does_not_open_fire_at_unaware_far_mech(self):
+        # review F1 case B: mech 3 hits us from out of sight; unaware mech 7 at 150 m must not be shot.
+        strat, obs = self.fresh()
+        me = obs["self"]["pos"]
+        obs["mechs"] = [_mech(7, (me[0] + 150.0, me[1], me[2]))]
+        obs["events"] = [{"type": "damaged", "amount": 45, "weapon": "gun", "bearing": 1.0, "by": 3}]
+        action = strat.act(obs)
+        self.assertEqual(strat._hit_by, 3)
+        self.assertEqual(action["fire"], [False, False])
+        self.assertEqual(self.plan(strat, obs, under_fire=True), (False, None))
+
+    def test_hidden_attacker_still_allows_near_mech(self):
+        # Attacker out of sight, but a visible mech is inside quiet range: the quiet gate applies to it.
+        strat, obs = self.fresh()
+        me = obs["self"]["pos"]
+        obs["mechs"] = [_mech(7, (me[0] + 30.0, me[1], me[2]))]
+        strat._hit_by = 3
+        strat._hit_t = obs["t"]
+        self.assertEqual(self.plan(strat, obs, under_fire=True), (True, 7))
+
     def test_decisions_always_send_explicit_fire_intent(self):
         strat, obs = self.fresh()
         action = strat.act(obs)

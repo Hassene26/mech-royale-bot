@@ -216,22 +216,21 @@ class Strategy:
         me = obs["self"]
         xy = me["pos"][:2]
         mechs = [m for m in obs["mechs"] if m["kind"] == "mech"]
+        if under_fire:
+            attacker = next((m for m in mechs if m["id"] == self._hit_by), None)
+            if attacker is not None:
+                return True, attacker["id"]  # return fire at the visible mech that hurt us
+            # The attacker is out of sight: other mechs still get the quiet gate below (review F1).
         if mechs:
-            target = next((m for m in mechs if under_fire and m["id"] == self._hit_by), None)
-            if target is None:
-                pool = [m for m in mechs if m.get("charging")] or mechs
-                target = min(pool, key=lambda m: math.dist(xy, m["pos"][:2]))
+            pool = [m for m in mechs if m.get("charging")] or mechs
+            target = min(pool, key=lambda m: math.dist(xy, m["pos"][:2]))
             dist = math.dist(xy, target["pos"][:2])
-            if under_fire:
-                return True, target["id"]
             outnumbered = weakest and len(tracker.enemies) >= PARAMS["min_enemy_count_for_caution"]
             if outnumbered and engage <= PARAMS["flee_score_max"]:
                 return False, None  # outnumbered and weak: stay quiet
             if target.get("charging") or dist <= PARAMS["quiet_fire_range_m"]:
                 return True, target["id"]
             return False, None
-        if under_fire:
-            return True, None  # attacker out of sight: nothing visible to aim at
         if phase == "loot" and not tracker.enemies and me["in_zone"] and obs["crates"]:
             crate = min(obs["crates"], key=lambda c: math.dist(xy, c["pos"][:2]))
             if math.dist(xy, crate["pos"][:2]) <= PARAMS["crate_fire_range_m"]:
@@ -246,7 +245,9 @@ class Strategy:
         xy = tuple(me["pos"][:2])
 
         for e in obs["events"]:
-            if e.get("type") == "damaged" and e.get("by") is not None:
+            # Only a mech attacker counts (NPC ids are outside 0..mechs-1; zone has by=None).
+            by = e.get("by")
+            if e.get("type") == "damaged" and isinstance(by, int) and 0 <= by < self.cfg["match"]["mechs"]:
                 self._hit_t = t
                 self._hit_bearing = e.get("bearing")
                 self._hit_by = e.get("by")
