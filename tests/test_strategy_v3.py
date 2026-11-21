@@ -129,6 +129,28 @@ class StrategyV3Test(unittest.TestCase):
         strat._hit_t = obs["t"]
         self.assertEqual(self.plan(strat, obs, under_fire=True), (True, 7))
 
+    def test_hidden_attacker_stops_crate_farming(self):
+        strat, obs = self.fresh(mechs=[], sounds=[])
+        x, y, z = obs["self"]["pos"]
+        obs["crates"] = [{"id": 1019, "pos": [x + 10, y, z], "hp": 300}]
+        obs["events"] = [{"type": "damaged", "amount": 45, "weapon": "gun", "bearing": 1.0, "by": 3}]
+        strat.act(obs)
+        self.assertEqual(self.plan(strat, obs, under_fire=True, phase="loot"), (False, None))
+
+    def test_destroyed_crate_does_not_block_detour_to_visible_cube(self):
+        strat, obs = self.fresh(mechs=[], sounds=[], cubes=[])
+        x, y, z = obs["self"]["pos"]
+        obs["zone"].update(next_center=[x, y], next_radius=380)
+        obs["crates"] = [{"id": 1019, "pos": [x + 8, y, z], "hp": 45}]
+        strat.tracker.update(obs)
+        obs["crates"] = []
+        cube_pos = [x + 11, y + 5, z]
+        obs["cubes"] = [{"id": 5000, "pos": cube_pos}]
+        obs["events"] = [{"type": "hit", "target": 1019, "amount": 45, "weapon": "gun"}]
+        obs["t"] += 0.1
+        strat.tracker.update(obs)
+        self.assertEqual(tuple(strat._nav_target(obs, strat.tracker, "loot")), tuple(cube_pos))
+
     def test_decisions_always_send_explicit_fire_intent(self):
         strat, obs = self.fresh()
         action = strat.act(obs)

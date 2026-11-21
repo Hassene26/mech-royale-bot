@@ -165,7 +165,8 @@ class Strategy:
         inner = max(0.0, radius - PARAMS["cover_zone_margin_m"])
         locally_safe = inner > 0 and math.dist(xy, center) <= inner
         if phase == "loot" and locally_safe:
-            candidates = [v[0] for v in tracker.crates.values()] + [v[0] for v in tracker.cubes.values()]
+            # A removed crate or cube can stay in tracker memory. Only detour for visible loot.
+            candidates = [item["pos"] for item in obs["crates"] + obs["cubes"]]
             nearby = [p for p in candidates if math.dist(p[:2], xy) <= PARAMS["loot_detour_radius_m"]
                       and math.dist(p[:2], center) <= inner]
             if nearby:
@@ -239,7 +240,7 @@ class Strategy:
             if target.get("charging") or dist <= PARAMS["quiet_fire_range_m"]:
                 return True, target["id"]
             return False, None
-        if phase == "loot" and not tracker.enemies and me["in_zone"] and obs["crates"]:
+        if phase == "loot" and not under_fire and not tracker.enemies and me["in_zone"] and obs["crates"]:
             crate = min(obs["crates"], key=lambda c: math.dist(xy, c["pos"][:2]))
             if math.dist(xy, crate["pos"][:2]) <= PARAMS["crate_fire_range_m"]:
                 return True, crate["id"]  # farming a near crate with no threat known
