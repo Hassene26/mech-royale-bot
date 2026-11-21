@@ -158,28 +158,36 @@ class Strategy:
     def _nav_target(self, obs, tracker, phase):
         pos = obs["self"]["pos"]
         xy = tuple(pos[:2])
+        center, radius = tracker.safe_center_xy, tracker.safe_radius
         if phase == "endgame":
-            return tracker.safe_center_xy
-        if phase in ("preposition", "hide"):
-            threats = [tr.pos[:2] for tr in tracker.enemies.values()]
-            if tracker.world is not None:
-                try:
-                    center, radius = tracker.safe_center_xy, tracker.safe_radius
-                    goal = tracker.world.best_hide(
-                        center, min(radius, PARAMS["hide_search_radius_m"]), threats,
-                        zone_next=(center, radius), me_xy=xy,
-                    )
-                    return (float(goal[0]), float(goal[1]))
-                except Exception as exc:
-                    if not self.reported_hide_error:
-                        log("Cover selection failed, using zone center:", exc)
-                        self.reported_hide_error = True
-            return tracker.safe_center_xy
-        # loot: head for the nearest remembered crate/cube, else drift toward the safe circle
-        candidates = [v[0] for v in tracker.crates.values()] + [v[0] for v in tracker.cubes.values()]
-        if candidates:
-            return min(candidates, key=lambda p: math.dist(pos[:2], p[:2]))
-        return tracker.safe_center_xy
+            return center
+
+        inner = max(0.0, radius - PARAMS["cover_zone_margin_m"])
+        locally_safe = inner > 0 and math.dist(xy, center) <= inner
+        if phase == "loot" and locally_safe:
+            candidates = [v[0] for v in tracker.crates.values()] + [v[0] for v in tracker.cubes.values()]
+            nearby = [p for p in candidates if math.dist(p[:2], xy) <= PARAMS["loot_detour_radius_m"]
+                      and math.dist(p[:2], center) <= inner]
+            if nearby:
+                return min(nearby, key=lambda p: math.dist(xy, p[:2]))
+
+        # Once staged inside the next circle, use nearby cover instead of crossing
+        # open ground to reach a hiding spot near the center.
+        search_center = xy if locally_safe else center
+        search_radius = PARAMS["cover_radius_m"] if locally_safe else PARAMS["hide_search_radius_m"]
+        threats = [tr.pos[:2] for tr in tracker.enemies.values()]
+        if tracker.world is not None:
+            try:
+                goal = tracker.world.best_hide(
+                    search_center, min(search_radius, radius), threats,
+                    zone_next=(center, inner if locally_safe else radius), me_xy=xy,
+                )
+                return (float(goal[0]), float(goal[1]))
+            except Exception as exc:
+                if not self.reported_hide_error:
+                    log("Cover selection failed, using the search center:", exc)
+                    self.reported_hide_error = True
+        return search_center
 
     def _move_toward(self, obs, tracker, goal):
         """Move vector toward goal, braked so we stop on the goal instead of overshooting it

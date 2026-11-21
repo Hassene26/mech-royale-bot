@@ -15,6 +15,7 @@ PARAMS = {
     # --- loot (PLAN: prefer low-risk loot early, stop farming once a fight could start) ---
     "loot_phase_end_s": 60.0,        # stop treating this as the pure-loot opening phase after this match time
     "loot_priority_default": True,   # intent["loot_priority"] baseline during the loot phase
+    "loot_detour_radius_m": 35.0,    # only divert to nearby loot inside the next circle
 
     # --- nav / fallback (used when tracker.world is unavailable, e.g. world.py not yet loaded) ---
     "hide_search_radius_m": 60.0,    # radius passed to world.best_hide
